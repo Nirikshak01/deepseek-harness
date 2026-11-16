@@ -7,8 +7,9 @@
 use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use tauri::{AppHandle, Emitter};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest};
 use tracing::{info, warn};
 
 #[derive(Clone)]
@@ -54,8 +55,13 @@ impl WsBridge {
         }
         req.headers_mut().insert("host", format!("127.0.0.1:{port}").parse().unwrap());
 
-        info!("Connecting WebSocket bridge to {url}");
-        let (ws_stream, _) = connect_async(req)
+        info!("Connecting WebSocket bridge to {url} with TCP_NODELAY");
+        let tcp_stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| format!("WS TCP connect failed: {e}"))?;
+        let _ = tcp_stream.set_nodelay(true);
+
+        let (ws_stream, _) = client_async(req, tcp_stream)
             .await
             .map_err(|e| format!("WS connect failed: {e}"))?;
 
@@ -86,7 +92,7 @@ impl WsBridge {
             while let Some(msg_res) = read.next().await {
                 match msg_res {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                        let _ = app_handle.emit("dsh://ws-message", text.to_string());
+                        let _ = app_handle.emit("dsh://ws-message", text.as_str());
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
                         info!("WS bridge closed by server");

@@ -58,6 +58,67 @@ export function renderGeneralPage() {
         </div>
       </div>
     </div>
+
+    <!-- Desktop Integration & Notifications -->
+    <div class="settings-group">
+      <h3 class="settings-group-title">Desktop & Notifications</h3>
+
+      <!-- Close to Tray -->
+      <div class="settings-row">
+        <div class="settings-row-text">
+          <span class="settings-row-label">Close to Tray</span>
+          <span class="settings-row-sub">Keep DeepSeek Harness running in the Linux system tray when closing the window.</span>
+        </div>
+        <div class="settings-row-control">
+          <label class="switch-control">
+            <input type="checkbox" id="setting-close-to-tray" ${(settings.notifications?.closeToTray ?? true) ? 'checked' : ''}>
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Approvals / Permission requests -->
+      <div class="settings-row">
+        <div class="settings-row-text">
+          <span class="settings-row-label">Command Approvals</span>
+          <span class="settings-row-sub">Send a desktop notification when tool execution requires confirmation.</span>
+        </div>
+        <div class="settings-row-control">
+          <label class="switch-control">
+            <input type="checkbox" id="setting-notif-approvals" ${(settings.notifications?.approvals ?? true) ? 'checked' : ''}>
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Agent Question Prompts -->
+      <div class="settings-row">
+        <div class="settings-row-text">
+          <span class="settings-row-label">Agent Question Prompts</span>
+          <span class="settings-row-sub">Send a desktop notification when the model asks a follow-up question.</span>
+        </div>
+        <div class="settings-row-control">
+          <label class="switch-control">
+            <input type="checkbox" id="setting-notif-questions" ${(settings.notifications?.questions ?? true) ? 'checked' : ''}>
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Task Completion Alerts -->
+      <div class="settings-row">
+        <div class="settings-row-text">
+          <span class="settings-row-label">Task Completion Alerts</span>
+          <span class="settings-row-sub">Send a desktop notification when background tasks and long-running turns complete.</span>
+        </div>
+        <div class="settings-row-control">
+          <label class="switch-control">
+            <input type="checkbox" id="setting-notif-tasks" ${(settings.notifications?.taskAlerts ?? true) ? 'checked' : ''}>
+            <span class="switch-slider"></span>
+          </label>
+        </div>
+      </div>
+    </div>
   `;
 
   // Attach Working Event Handlers
@@ -85,6 +146,40 @@ export function renderGeneralPage() {
       store.updateSetting('general', 'language', val);
       showToast('Language set to English', 'success');
     }
+  });
+
+  // Desktop Notifications & Close to Tray toggles
+  const updateNotifPref = (key, val) => {
+    const current = store.getState().settings.general?.notifications || {};
+    store.updateSetting('general', 'notifications', {
+      ...current,
+      [key]: val
+    });
+  };
+
+  const closeToTrayInput = container.querySelector('#setting-close-to-tray');
+  closeToTrayInput?.addEventListener('change', (e) => {
+    const checked = e.target.checked;
+    updateNotifPref('closeToTray', checked);
+    if (window.__TAURI__ && window.__TAURI__.core) {
+      window.__TAURI__.core.invoke('cmd_set_close_to_tray', { enabled: checked }).catch(() => {});
+    }
+    showToast(checked ? 'Close to tray enabled' : 'Close to tray disabled', 'info');
+  });
+
+  const approvalsInput = container.querySelector('#setting-notif-approvals');
+  approvalsInput?.addEventListener('change', (e) => {
+    updateNotifPref('approvals', e.target.checked);
+  });
+
+  const questionsInput = container.querySelector('#setting-notif-questions');
+  questionsInput?.addEventListener('change', (e) => {
+    updateNotifPref('questions', e.target.checked);
+  });
+
+  const tasksInput = container.querySelector('#setting-notif-tasks');
+  tasksInput?.addEventListener('change', (e) => {
+    updateNotifPref('taskAlerts', e.target.checked);
   });
 
   return container;

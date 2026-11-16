@@ -25,7 +25,7 @@ use tokio::{
     sync::Mutex,
     time::sleep,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ws::WsBridge;
 
@@ -154,7 +154,7 @@ impl DshSidecar {
         Ok(())
     }
 
-    /// Gracefully stop the daemon.
+    /// Gracefully stop the daemon process tree (SIGTERM followed by SIGKILL to prevent zombies).
     pub async fn stop(&self) {
         let mut guard = self.inner.lock().await;
         guard.stopping = true;
@@ -162,8 +162,35 @@ impl DshSidecar {
 
         if let Some(mut child) = guard.child.take() {
             let pid = child.id();
-            info!("Stopping dsh daemon (pid={pid:?})");
-            let _ = child.kill().await;
+            info!("Stopping dsh daemon process tree (pid={pid:?})");
+            #[cfg(unix)]
+            if let Some(p) = pid {
+                extern "C" {
+                    fn kill(pid: i32, sig: i32) -> i32;
+                }
+                const SIGTERM: i32 = 15;
+                const SIGKILL: i32 = 9;
+
+                let pgid = p as i32;
+                unsafe {
+                    // Send SIGTERM to entire process group
+                    kill(-pgid, SIGTERM);
+                }
+
+                // Wait up to 1200ms for graceful shutdown
+                let exited = tokio::time::timeout(Duration::from_millis(1200), child.wait()).await;
+                if exited.is_err() {
+                    warn!("Process group -{pgid} did not terminate within timeout; sending SIGKILL");
+                    unsafe {
+                        kill(-pgid, SIGKILL);
+                    }
+                    let _ = child.wait().await;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill().await;
+            }
         }
     }
 
@@ -368,7 +395,7 @@ async fn spawn_daemon_child(probed_env: &HashMap<String, String>) -> std::io::Re
         })
         .unwrap_or_else(|| PathBuf::from("/usr/bin/node"));
 
-    println!(
+    debug!(
         ">>> [DAEMON:SPAWN] node={:?} root={:?} tsx={:?} bin={:?} requested_port={requested_port}",
         node_path, repo_root, tsx_cli, bin_ts
     );
@@ -377,8 +404,8 @@ async fn spawn_daemon_child(probed_env: &HashMap<String, String>) -> std::io::Re
         node_path, repo_root
     );
 
-    let child = Command::new(&node_path)
-        .arg(&tsx_cli)
+    let mut cmd = Command::new(&node_path);
+    cmd.arg(&tsx_cli)
         .arg(&bin_ts)
         .arg("web")
         .arg("--no-open")
@@ -389,8 +416,12 @@ async fn spawn_daemon_child(probed_env: &HashMap<String, String>) -> std::io::Re
         .current_dir(&repo_root)
         .envs(probed_env)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd.spawn()?;
 
     Ok((child, requested_port))
 }
@@ -438,7 +469,7 @@ async fn run_supervisor_loop(app: AppHandle, inner: Arc<Mutex<SupervisorState>>)
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    println!(">>> [DAEMON:OUT] {line}");
+                    debug!(">>> [DAEMON:OUT] {line}");
                     append_log(&inner_stdout, format!("[daemon:out] {line}")).await;
                     check_readiness_line(&app_stdout, &inner_stdout, &line).await;
                 }
@@ -451,7 +482,7 @@ async fn run_supervisor_loop(app: AppHandle, inner: Arc<Mutex<SupervisorState>>)
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    eprintln!(">>> [DAEMON:ERR] {line}");
+                    debug!(">>> [DAEMON:ERR] {line}");
                     append_log(&inner_stderr, format!("[daemon:err] {line}")).await;
                 }
             });
@@ -561,7 +592,6 @@ async fn check_readiness_line(app: &AppHandle, inner: &Arc<Mutex<SupervisorState
                 "[masked]".to_string()
             }
         });
-        println!(">>> [DAEMON:READY] Daemon reported ready on port {port} with token {masked_tok:?}");
         info!("Daemon reported ready on port {port} with token {masked_tok:?}");
 
         // Exchange launch token for authority-bound session cookie via loopback HTTP GET
@@ -577,7 +607,6 @@ async fn check_readiness_line(app: &AppHandle, inner: &Arc<Mutex<SupervisorState
                     if let Some(cookie) = resp.headers().get("set-cookie") {
                         if let Ok(cookie_str) = cookie.to_str() {
                             let clean = cookie_str.split(';').next().unwrap_or(cookie_str).to_string();
-                            println!(">>> [AUTH:COOKIE] Exchanged launch token for cookie");
                             info!("Successfully exchanged launch token for auth cookie");
                             cookie_header = Some(clean);
                         }
@@ -611,7 +640,7 @@ async fn check_readiness_line(app: &AppHandle, inner: &Arc<Mutex<SupervisorState
 
         // Inject into webview window (safe: masked token or omitted)
         if let Some(win) = app.get_webview_window("main") {
-            println!(">>> [WINDOW:INJECT] Injecting __DSH_DAEMON_INFO__ into main window");
+            debug!(">>> [WINDOW:INJECT] Injecting __DSH_DAEMON_INFO__ into main window");
             let script = format!(
                 "window.__DSH_DAEMON_INFO__ = {{ status: 'ready', port: {} }}; \
                  if (typeof window.__onDaemonReady === 'function') {{ \
@@ -621,7 +650,7 @@ async fn check_readiness_line(app: &AppHandle, inner: &Arc<Mutex<SupervisorState
             );
             let _ = win.eval(&script);
         } else {
-            println!(">>> [WINDOW:WARN] main webview window not found for injection");
+            warn!("main webview window not found for injection");
         }
     }
 }

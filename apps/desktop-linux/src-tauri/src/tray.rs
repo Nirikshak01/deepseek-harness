@@ -9,25 +9,33 @@
 //! - **──────────**
 //! - **Quit**       → cleanly exit
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 use tracing::info;
 
 use crate::sidecar::DshSidecar;
 
+pub static NOTIFICATIONS_MUTED: AtomicBool = AtomicBool::new(false);
+pub static MINIMAL_VIEW: AtomicBool = AtomicBool::new(false);
+
 /// Build the tray icon and wire up its event handler.
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
-    let hide = MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;
+    let open_win = MenuItem::with_id(app, "open_window", "Open Window", true, None::<&str>)?;
+    let toggle_minimal = MenuItem::with_id(app, "toggle_minimal", "Toggle Minimal View", true, None::<&str>)?;
+    let toggle_mute = MenuItem::with_id(app, "toggle_mute", "Mute Notifications", true, None::<&str>)?;
     let separator1 = PredefinedMenuItem::separator(app)?;
     let restart = MenuItem::with_id(app, "restart_dsh", "Restart dsh", true, None::<&str>)?;
     let separator2 = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[&show, &hide, &separator1, &restart, &separator2, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&open_win, &toggle_minimal, &toggle_mute, &separator1, &restart, &separator2, &quit],
+    )?;
 
     TrayIconBuilder::with_id("main")
         .tooltip("DeepSeek Harness")
@@ -54,15 +62,27 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
-        "show" => {
+        "open_window" | "show" => {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
+                let _ = win.unminimize();
                 let _ = win.set_focus();
             }
         }
-        "hide" => {
+        "toggle_minimal" => {
+            let next = !MINIMAL_VIEW.load(Ordering::Relaxed);
+            MINIMAL_VIEW.store(next, Ordering::Relaxed);
+            info!("Tray toggled minimal view: {next}");
             if let Some(win) = app.get_webview_window("main") {
-                let _ = win.hide();
+                let _ = win.emit("dsh://toggle-minimal-view", next);
+            }
+        }
+        "toggle_mute" => {
+            let next = !NOTIFICATIONS_MUTED.load(Ordering::Relaxed);
+            NOTIFICATIONS_MUTED.store(next, Ordering::Relaxed);
+            info!("Tray toggled mute notifications: {next}");
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.emit("dsh://toggle-mute", next);
             }
         }
         "restart_dsh" => {

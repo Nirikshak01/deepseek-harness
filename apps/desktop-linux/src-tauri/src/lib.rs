@@ -41,7 +41,7 @@ pub fn run() {
         use std::io::Write;
         info!("Existing instance detected. Forwarding invocation and focusing main window.");
         let args: Vec<String> = std::env::args().collect();
-        let payload = args.get(1).cloned().unwrap_or_else(|| "dsh://focus".to_string());
+        let payload = serde_json::to_string(&args).unwrap_or_else(|_| "[]".to_string());
         let _ = writeln!(stream, "{payload}");
 
         // Also trigger xdotool windowactivate as fallback
@@ -74,8 +74,13 @@ pub fn run() {
             app.manage(sidecar);
 
             // Build the system tray
-            if let Err(e) = setup_tray(&app.handle()) {
+            if let Err(e) = setup_tray(app.handle()) {
                 tracing::warn!("Failed to initialize system tray (running in window-only mode): {e}");
+            }
+
+            // Restore window geometry before initial render
+            if let Some(win) = app.get_webview_window("main") {
+                restore_window_geometry(&win);
             }
 
             // Kick off the sidecar supervisor asynchronously
@@ -98,11 +103,20 @@ pub fn run() {
                         let mut reader = tokio::io::BufReader::new(stream);
                         let mut line = String::new();
                         if reader.read_line(&mut line).await.is_ok() {
-                            let url = line.trim().to_string();
-                            info!("Single-instance invocation received: {url}");
+                            let trimmed = line.trim().to_string();
+                            info!("Single-instance invocation received: {trimmed}");
                             focus_main_window(&handle_socket);
                             if let Some(win) = handle_socket.get_webview_window("main") {
-                                let _ = win.emit("dsh://oauth-callback", url);
+                                let _ = win.emit("single-instance", &trimmed);
+                                if let Ok(args_vec) = serde_json::from_str::<Vec<String>>(&trimmed) {
+                                    for arg in args_vec {
+                                        if arg.starts_with("dsh://") {
+                                            let _ = win.emit("dsh://oauth-callback", arg);
+                                        }
+                                    }
+                                } else if trimmed.starts_with("dsh://") {
+                                    let _ = win.emit("dsh://oauth-callback", &trimmed);
+                                }
                             }
                         }
                     }
@@ -123,13 +137,26 @@ pub fn run() {
 
             Ok(())
         })
-        // ── Window Events (Close hides to tray) ────────────────────────────────
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Hide window to system tray instead of destroying running agent jobs
-                let _ = window.hide();
-                api.prevent_close();
+        // ── Window Events ───────────────────────────────────────────────────────
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                if CLOSE_TO_TRAY.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = window.hide();
+                    api.prevent_close();
+                } else {
+                    let app = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(sidecar) = app.try_state::<DshSidecar>() {
+                            sidecar.stop().await;
+                        }
+                        app.exit(0);
+                    });
+                }
             }
+            tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) => {
+                save_window_geometry(window);
+            }
+            _ => {}
         })
         // ── IPC Commands ──────────────────────────────────────────────────────
         .invoke_handler(tauri::generate_handler![
@@ -148,6 +175,9 @@ pub fn run() {
             cmd_ws_ensure_connected,
             cmd_log_webview,
             cmd_focus_window,
+            cmd_dispatch_notification,
+            cmd_set_close_to_tray,
+            cmd_get_close_to_tray,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DeepSeek Harness");
@@ -199,21 +229,18 @@ async fn cmd_pick_directory() -> Result<Option<String>, String> {
     };
 
     // Try zenity first
-    match tokio::process::Command::new("zenity")
+    if let Ok(output) = tokio::process::Command::new("zenity")
         .args(["--file-selection", "--directory", "--title=Select Workspace Directory"])
         .output()
         .await
     {
-        Ok(output) => {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Ok(Some(path));
-                }
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(Some(path));
             }
-            return Ok(None);
         }
-        Err(_) => {}
+        return Ok(None);
     }
 
     // Try kdialog only if zenity was not found
@@ -242,7 +269,7 @@ async fn cmd_pick_file() -> Result<Option<String>, String> {
     };
 
     // Try zenity first
-    match tokio::process::Command::new("zenity")
+    if let Ok(output) = tokio::process::Command::new("zenity")
         .args([
             "--file-selection",
             "--title=Select File to Attach (Images, Docs, Code)",
@@ -250,16 +277,13 @@ async fn cmd_pick_file() -> Result<Option<String>, String> {
         .output()
         .await
     {
-        Ok(output) => {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Ok(Some(path));
-                }
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(Some(path));
             }
-            return Ok(None);
         }
-        Err(_) => {}
+        return Ok(None);
     }
 
     // Try kdialog only if zenity was not found
@@ -410,7 +434,7 @@ async fn cmd_call_rpc(
     let port = port.ok_or_else(|| "Daemon is not ready yet".to_string())?;
 
     let full_method = format!("{namespace}/{method}");
-    println!(">>> [RPC:REQ] {full_method}");
+    tracing::debug!(">>> [RPC:REQ] {full_method}");
     let rpc_id = format!(
         "rpc-{}",
         std::time::SystemTime::now()
@@ -452,7 +476,7 @@ async fn cmd_call_rpc(
         .map_err(|e| format!("Failed to connect to daemon: {e}"))?;
 
     let status = resp.status();
-    println!(">>> [RPC:RES] {namespace}/{method} -> status={status}");
+    tracing::debug!(">>> [RPC:RES] {namespace}/{method} -> status={status}");
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         return Err(format!("HTTP {status}: {text}"));
@@ -488,7 +512,7 @@ async fn cmd_call_rpc(
 /// Send a frame into the WebSocket multiplexer on /api/remote.mux.
 #[tauri::command]
 async fn cmd_ws_send(sidecar: State<'_, DshSidecar>, message: String) -> Result<(), String> {
-    println!(">>> [WS:SEND] {message}");
+    tracing::debug!(">>> [WS:SEND] {message}");
     sidecar.ws_send(message).await
 }
 
@@ -504,7 +528,7 @@ async fn cmd_ws_ensure_connected(
 /// Relay webview diagnostic logs to Tauri standard output.
 #[tauri::command]
 async fn cmd_log_webview(level: String, msg: String) -> Result<(), String> {
-    println!(">>> [WEBVIEW:{level}] {msg}");
+    tracing::debug!(">>> [WEBVIEW:{level}] {msg}");
     match level.as_str() {
         "error" => tracing::error!("[webview] {msg}"),
         "warn" => tracing::warn!("[webview] {msg}"),
@@ -516,10 +540,119 @@ async fn cmd_log_webview(level: String, msg: String) -> Result<(), String> {
 /// Bring the main window to the foreground (used by OAuth callback and single-instance guard).
 #[tauri::command]
 async fn cmd_focus_window(app: AppHandle) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
-    }
+    focus_main_window(&app);
     Ok(())
+}
+
+static CLOSE_TO_TRAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[tauri::command]
+async fn cmd_set_close_to_tray(enabled: bool) -> Result<(), String> {
+    CLOSE_TO_TRAY.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    info!("Close to tray set to: {enabled}");
+    Ok(())
+}
+
+#[tauri::command]
+async fn cmd_get_close_to_tray() -> Result<bool, String> {
+    Ok(CLOSE_TO_TRAY.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Dispatch native Linux desktop notification if the app window is unfocused/minimized/hidden.
+/// Clicking the notification brings the window to the front and focuses the target card.
+#[tauri::command]
+async fn cmd_dispatch_notification(
+    app: AppHandle,
+    title: String,
+    body: String,
+    target_card_id: Option<String>,
+) -> Result<bool, String> {
+    if let Some(win) = app.get_webview_window("main") {
+        let is_focused = win.is_focused().unwrap_or(false);
+        let is_visible = win.is_visible().unwrap_or(true);
+        let is_minimized = win.is_minimized().unwrap_or(false);
+        if is_focused && is_visible && !is_minimized {
+            // Already focused in foreground, skip system notification
+            return Ok(false);
+        }
+    }
+
+    let handle_click = app.clone();
+    let card_target = target_card_id.clone();
+
+    std::thread::spawn(move || {
+        let mut notif = notify_rust::Notification::new();
+        notif
+            .summary(&title)
+            .body(&body)
+            .appname("DeepSeek Harness")
+            .icon("dsh-desktop-linux")
+            .action("default", "Open")
+            .timeout(notify_rust::Timeout::Milliseconds(8000));
+
+        if let Ok(handle) = notif.show() {
+            handle.wait_for_action(move |action| {
+                if action == "default" || action == "clicked" {
+                    focus_main_window(&handle_click);
+                    if let Some(target) = card_target {
+                        let _ = handle_click.emit("dsh://focus-card", target);
+                    }
+                }
+            });
+        }
+    });
+
+    Ok(true)
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WindowGeometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    maximized: bool,
+}
+
+fn window_state_path() -> std::path::PathBuf {
+    get_user_home().join(".dsh").join("window-state.json")
+}
+
+fn save_window_geometry(win: &tauri::Window) {
+    if let (Ok(pos), Ok(size), Ok(maximized)) = (win.outer_position(), win.outer_size(), win.is_maximized()) {
+        if !maximized && size.width > 200 && size.height > 200 {
+            let geom = WindowGeometry {
+                x: pos.x,
+                y: pos.y,
+                width: size.width,
+                height: size.height,
+                maximized: false,
+            };
+            if let Ok(json) = serde_json::to_string(&geom) {
+                let _ = std::fs::create_dir_all(get_user_home().join(".dsh"));
+                let _ = std::fs::write(window_state_path(), json);
+            }
+        } else if maximized {
+            if let Ok(content) = std::fs::read_to_string(window_state_path()) {
+                if let Ok(mut geom) = serde_json::from_str::<WindowGeometry>(&content) {
+                    geom.maximized = true;
+                    if let Ok(json) = serde_json::to_string(&geom) {
+                        let _ = std::fs::write(window_state_path(), json);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn restore_window_geometry(win: &tauri::WebviewWindow) {
+    if let Ok(content) = std::fs::read_to_string(window_state_path()) {
+        if let Ok(geom) = serde_json::from_str::<WindowGeometry>(&content) {
+            let _ = win.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(geom.x, geom.y)));
+            let _ = win.set_size(tauri::Size::Physical(tauri::PhysicalSize::new(geom.width, geom.height)));
+            if geom.maximized {
+                let _ = win.maximize();
+            }
+        }
+    }
 }

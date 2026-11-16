@@ -190,6 +190,52 @@ function setupDaemonStatusListener() {
   const pillText = document.getElementById('engine-pill-text');
   const centerDot = document.getElementById('center-engine-dot');
   const centerText = document.getElementById('center-engine-text');
+  const offlineBanner = document.getElementById('daemon-offline-banner');
+  const offlineMsg = document.getElementById('daemon-offline-msg');
+  const btnRetry = document.getElementById('btn-offline-retry');
+
+  let reconnectTimer = null;
+  let backoffMs = 1500;
+
+  const triggerReconnectAttempt = async () => {
+    if (apiClient.status === 'ready') return;
+    try {
+      if (offlineMsg) offlineMsg.textContent = 'Probing daemon connection...';
+      const probed = await apiClient.probe();
+      if (!probed && window.__TAURI__?.core) {
+        // Attempt supervisor restart if direct probe fails
+        await window.__TAURI__.core.invoke('cmd_restart_daemon').catch(() => {});
+        await apiClient.probe();
+      }
+    } catch (e) {
+      console.warn('Reconnect probe error:', e);
+    }
+  };
+
+  const scheduleReconnectBackoff = () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    const displaySeconds = Math.round(backoffMs / 1000);
+    if (offlineMsg) offlineMsg.textContent = `DeepSeek daemon disconnected. Reconnecting in ${displaySeconds}s...`;
+
+    reconnectTimer = setTimeout(async () => {
+      await triggerReconnectAttempt();
+      if (apiClient.status !== 'ready') {
+        backoffMs = Math.min(Math.round(backoffMs * 1.5), 10000);
+        scheduleReconnectBackoff();
+      }
+    }, backoffMs);
+  };
+
+  btnRetry?.addEventListener('click', async () => {
+    btnRetry.textContent = 'Probing...';
+    btnRetry.disabled = true;
+    try {
+      await triggerReconnectAttempt();
+    } finally {
+      btnRetry.textContent = 'Retry Now';
+      btnRetry.disabled = false;
+    }
+  });
 
   apiClient.onStatusChange((state) => {
     let statusStr = 'Standby • Port ' + state.port;
@@ -198,16 +244,30 @@ function setupDaemonStatusListener() {
     if (state.status === 'ready') {
       statusStr = `Connected • Port ${state.port}`;
       isConnected = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      backoffMs = 1500;
+      offlineBanner?.classList.add('hidden');
+
       // Initialize default model on daemon (maps to deepseek-account if signed in)
       callRpc('session', 'initializeDefaultModel', {}).catch(e => {
         console.warn('initializeDefaultModel notice:', e);
       });
     } else if (state.status === 'starting') {
       statusStr = `Starting • Port ${state.port}`;
+      if (offlineMsg) offlineMsg.textContent = 'Starting DeepSeek daemon...';
+      offlineBanner?.classList.remove('hidden');
     } else if (state.status === 'error') {
       statusStr = 'Error • Daemon Failed';
+      offlineBanner?.classList.remove('hidden');
+      if (offlineMsg) offlineMsg.textContent = state.error ? `Daemon error: ${state.error}` : 'Daemon crashed. Reconnecting...';
+      scheduleReconnectBackoff();
     } else if (state.status === 'offline') {
       statusStr = 'Offline';
+      offlineBanner?.classList.remove('hidden');
+      scheduleReconnectBackoff();
     }
 
     if (pillDot) pillDot.className = `status-dot ${isConnected ? 'connected' : ''}`;
@@ -606,6 +666,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Attempt session restoration if credentials already exist
   await restoreStoredSession();
 
+  // Sync Close-to-Tray preference with Rust backend
+  const closeToTray = store.getState().settings.general?.notifications?.closeToTray ?? true;
+  if (window.__TAURI__ && window.__TAURI__.core) {
+    window.__TAURI__.core.invoke('cmd_set_close_to_tray', { enabled: closeToTray }).catch(() => {});
+  }
+
   // Listen for OAuth callback deep-link events from Tauri backend.
   // When user clicks "Open DeepSeek Harness" in browser, the dsh:// handler
   // fires, the Rust single-instance guard focuses this window, and Tauri
@@ -615,6 +681,34 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Focus window and bring to foreground
       window.__TAURI__.core.invoke('cmd_focus_window').catch(() => {});
       showToast('Browser sign-in callback received', 'success');
+    }).catch(() => {});
+
+    window.__TAURI__.event.listen('dsh://toggle-minimal-view', () => {
+      store.toggleSidebar();
+    }).catch(() => {});
+
+    window.__TAURI__.event.listen('dsh://toggle-mute', () => {
+      const current = store.getState().settings.general?.notifications || {};
+      const newMuted = !current.muted;
+      store.updateSetting('general', 'notifications', {
+        ...current,
+        muted: newMuted
+      });
+      showToast(newMuted ? 'Notifications muted' : 'Notifications unmuted', 'info');
+    }).catch(() => {});
+
+    window.__TAURI__.event.listen('dsh://focus-card', (event) => {
+      const cardId = event?.payload;
+      if (!cardId) return;
+      const el = document.querySelector(`[data-msg-id="${cardId}"]`) ||
+                 document.getElementById(cardId) ||
+                 document.querySelector('.approval-card') ||
+                 document.querySelector('.user-question-card');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('card-focus-pulse');
+        setTimeout(() => el.classList.remove('card-focus-pulse'), 2500);
+      }
     }).catch(() => {});
   }
 });

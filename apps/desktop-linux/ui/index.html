@@ -68,6 +68,13 @@
       </div>
     </header>
 
+    <!-- Offline / Reconnecting Banner -->
+    <div class="daemon-offline-banner hidden" id="daemon-offline-banner" role="alert">
+      <span class="offline-icon">⚠️</span>
+      <span class="offline-msg" id="daemon-offline-msg">Disconnected from DeepSeek daemon. Reconnecting...</span>
+      <button type="button" class="btn-offline-retry" id="btn-offline-retry">Retry Now</button>
+    </div>
+
     <!-- Main Content Stage -->
     <main class="app-stage">
       <!-- ── VIEW 1: PRISTINE AUTH SCREEN (Full ASCII Pond Canvas + Centered Mac-Style Card) ── -->

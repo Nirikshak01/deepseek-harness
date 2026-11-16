@@ -146,12 +146,8 @@ export function renderMessageItem(msg, onRegenerate) {
       }, 400);
     }
     const header = thinkEl.querySelector('.thinking-header');
-    const content = thinkEl.querySelector('.thinking-content');
-    const chevron = thinkEl.querySelector('.thinking-chevron');
     header.addEventListener('click', () => {
-      const isHidden = content.style.display === 'none';
-      content.style.display = isHidden ? 'block' : 'none';
-      chevron.innerHTML = isHidden ? icons.chevronDown('', 11) : icons.chevronRight('', 11);
+      thinkEl.classList.toggle('is-collapsed');
     });
     asstWrap.appendChild(thinkEl);
   }
@@ -319,7 +315,7 @@ export function renderMessageItem(msg, onRegenerate) {
 export function createUserQuestionCard(q) {
   const card = document.createElement('div');
   card.className = 'user-question-card';
-  card.style.cssText = 'border: 1px solid rgba(59, 130, 246, 0.35); border-radius: 12px; padding: 14px 16px; margin: 12px 0; background: var(--bg-surface-secondary, rgba(59, 130, 246, 0.04)); backdrop-filter: blur(8px);';
+  card.style.cssText = 'border: 1px solid rgba(59, 130, 246, 0.35); border-radius: 12px; padding: 14px 16px; margin: 12px 0; background: var(--bg-surface-secondary, rgba(59, 130, 246, 0.04));';
 
   const headingText = q.header || 'Question from DeepSeek Agent';
   const questionBody = q.question || 'Please select an option to continue:';
@@ -364,6 +360,156 @@ export function createUserQuestionCard(q) {
   return card;
 }
 
+export function updateAssistantMessageItem(asstWrap, msg) {
+  if (!asstWrap) return;
+
+  // 1. Thinking Indicator: remove if text or thinking or toolCall or error is present or not streaming
+  const thinkingIndicator = asstWrap.querySelector('.assistant-thinking-indicator');
+  if (thinkingIndicator && (!msg.isStreaming || msg.text || msg.thinking || msg.toolCall || msg.error)) {
+    thinkingIndicator.remove();
+  } else if (!thinkingIndicator && msg.isStreaming && !msg.text && !msg.thinking && !msg.toolCall && !msg.error) {
+    const loaderEl = document.createElement('div');
+    loaderEl.className = 'assistant-thinking-indicator';
+    loaderEl.innerHTML = `<span class="thinking-status thinking-cycling-text">Thinking...</span>`;
+    const actionsBar = asstWrap.querySelector('.message-actions-bar');
+    if (actionsBar) asstWrap.insertBefore(loaderEl, actionsBar);
+    else asstWrap.appendChild(loaderEl);
+  }
+
+  // 2. Thinking Block
+  if (msg.thinking) {
+    let thinkEl = asstWrap.querySelector('.thinking-block');
+    if (!thinkEl) {
+      thinkEl = document.createElement('div');
+      thinkEl.className = 'thinking-block';
+      const isThinkingLive = msg.isStreaming && !msg.text;
+      thinkEl.innerHTML = `
+        <div class="thinking-header" style="cursor: pointer; user-select: none;">
+          ${icons.sparkles('', 12)}
+          <span class="thinking-title-text">${isThinkingLive ? 'Thinking...' : 'Reasoning Chain'}</span>
+          <span class="thinking-chevron" style="margin-left: auto;">${icons.chevronDown('', 11)}</span>
+        </div>
+        <div class="thinking-content"></div>
+      `;
+      const header = thinkEl.querySelector('.thinking-header');
+      header.addEventListener('click', () => {
+        thinkEl.classList.toggle('is-collapsed');
+      });
+      const insertBeforeEl = asstWrap.querySelector('.assistant-prose, .tool-call-block, .approval-prompt-card, .user-question-card, .message-actions-bar');
+      if (insertBeforeEl) asstWrap.insertBefore(thinkEl, insertBeforeEl);
+      else asstWrap.appendChild(thinkEl);
+    }
+    const thinkContent = thinkEl.querySelector('.thinking-content');
+    if (thinkContent && thinkContent.textContent !== msg.thinking) {
+      thinkContent.textContent = msg.thinking;
+    }
+    const titleText = thinkEl.querySelector('.thinking-title-text');
+    if (titleText) {
+      const isThinkingLive = msg.isStreaming && !msg.text;
+      const expectedText = isThinkingLive ? 'Thinking...' : 'Reasoning Chain';
+      if (titleText.textContent !== expectedText) {
+        titleText.textContent = expectedText;
+      }
+    }
+  }
+
+  // 3. Prose (Incremental update without full DOM teardown)
+  if (msg.text) {
+    let proseEl = asstWrap.querySelector('.assistant-prose');
+    if (!proseEl) {
+      proseEl = document.createElement('div');
+      proseEl.className = 'assistant-prose';
+      const insertBeforeEl = asstWrap.querySelector('.tool-call-block, .approval-prompt-card, .user-question-card, .message-actions-bar');
+      if (insertBeforeEl) asstWrap.insertBefore(proseEl, insertBeforeEl);
+      else asstWrap.appendChild(proseEl);
+    }
+
+    const cursorHtml = msg.isStreaming ? '<span class="streaming-cursor">▋</span>' : '';
+    const newHtml = formatMarkdown(msg.text) + cursorHtml;
+    if (proseEl.__renderedHtml !== newHtml) {
+      proseEl.innerHTML = newHtml;
+      proseEl.__renderedHtml = newHtml;
+    }
+  }
+
+  // 4. Cancelled status tag
+  if (msg.wasCancelled && !asstWrap.querySelector('.status-pill-cancelled')) {
+    const identity = asstWrap.querySelector('.assistant-identity');
+    if (identity) {
+      const pill = document.createElement('span');
+      pill.className = 'status-pill-cancelled';
+      pill.style.cssText = 'font-size: 11px; padding: 2px 7px; border-radius: 999px; background: rgba(239,68,68,0.15); color: #f87171; font-weight: 500;';
+      pill.textContent = 'Cancelled';
+      identity.appendChild(pill);
+    }
+  }
+
+  // 5. Tool Call Block
+  if (msg.toolCall) {
+    let toolEl = asstWrap.querySelector('.tool-call-block');
+    const tc = msg.toolCall;
+    const isRunning = tc.duration === 'running...';
+    const isError = tc.isError || (typeof tc.output === 'string' && tc.output.includes('Error:'));
+
+    if (!toolEl) {
+      toolEl = document.createElement('div');
+      toolEl.className = 'tool-call-block';
+      toolEl.innerHTML = `
+        <div class="tool-call-header">
+          <div class="tool-call-title">
+            ${icons.terminal('', 14)}
+            <span>${tc.toolName || 'bash'}</span>
+          </div>
+          <div class="tool-status-badge ${isRunning ? 'is-running' : isError ? 'is-error' : 'is-success'}">
+            <span class="tool-status-dot"></span>
+            <span class="tool-status-text">${isRunning ? 'Running in sandbox...' : (tc.duration || '0.4s')}</span>
+          </div>
+        </div>
+        <div class="tool-call-cmd">
+          <span class="tool-call-cmd-prompt">$</span>
+          <span>${escapeHtml(tc.command)}</span>
+        </div>
+        ${tc.output ? `<pre class="tool-call-terminal"><code>${escapeHtml(tc.output)}</code></pre>` : ''}
+      `;
+      const actions = asstWrap.querySelector('.message-actions-bar');
+      if (actions) asstWrap.insertBefore(toolEl, actions);
+      else asstWrap.appendChild(toolEl);
+    } else {
+      const statusText = toolEl.querySelector('.tool-status-text');
+      const badge = toolEl.querySelector('.tool-status-badge');
+      if (statusText) statusText.textContent = isRunning ? 'Running in sandbox...' : (tc.duration || '0.4s');
+      if (badge) {
+        badge.className = `tool-status-badge ${isRunning ? 'is-running' : isError ? 'is-error' : 'is-success'}`;
+      }
+      let terminal = toolEl.querySelector('.tool-call-terminal code');
+      if (tc.output) {
+        if (!terminal) {
+          const pre = document.createElement('pre');
+          pre.className = 'tool-call-terminal';
+          pre.innerHTML = `<code>${escapeHtml(tc.output)}</code>`;
+          toolEl.appendChild(pre);
+        } else if (terminal.textContent !== tc.output) {
+          terminal.textContent = tc.output;
+        }
+      }
+    }
+  }
+
+  // 6. User Question Card
+  if (msg.userQuestion && !asstWrap.querySelector('.user-question-card')) {
+    const card = createUserQuestionCard(msg.userQuestion);
+    const actions = asstWrap.querySelector('.message-actions-bar');
+    if (actions) asstWrap.insertBefore(card, actions);
+    else asstWrap.appendChild(card);
+  }
+
+  // 7. Actions Bar positioning
+  const actionsBar = asstWrap.querySelector('.message-actions-bar');
+  if (actionsBar) {
+    asstWrap.appendChild(actionsBar);
+  }
+}
+
 function escapeHtml(val) {
   if (val === null || val === undefined) return '';
   if (typeof val === 'object') {
@@ -379,15 +525,19 @@ function escapeHtml(val) {
     .replace(/"/g, '&quot;');
 }
 
-function formatMarkdown(text) {
+export function formatMarkdown(text) {
   if (!text) return '';
   let formatted = escapeHtml(text);
-  // Fenced code blocks
+  // Fenced code blocks (closed)
   formatted = formatted.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_match, lang, code) => {
     return `<pre class="code-block" data-lang="${lang}" style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; margin: 8px 0; overflow-x: auto;"><code>${code}</code></pre>`;
   });
+  // Fenced code blocks (unclosed trailing during live streaming)
+  formatted = formatted.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*)$/g, (_match, lang, code) => {
+    return `<pre class="code-block is-streaming-code" data-lang="${lang}" style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; margin: 8px 0; overflow-x: auto;"><code>${code}</code></pre>`;
+  });
   // Inline code: `code`
-  formatted = formatted.replace(/`([^`]+)`/g, '<code style="background: rgba(255,255,255,0.08); padding: 2px 5px; border-radius: 4px; font-size: 0.9em;">$1</code>');
+  formatted = formatted.replace(/`([^`\n]+)`/g, '<code style="background: rgba(255,255,255,0.08); padding: 2px 5px; border-radius: 4px; font-size: 0.9em;">$1</code>');
   // Bold: **text**
   formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   // Paragraphs / line breaks outside <pre>

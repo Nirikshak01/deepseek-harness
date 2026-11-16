@@ -25,18 +25,17 @@
   border-right: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
-  transition: width 240ms cubic-bezier(0.16, 1, 0.3, 1), min-width 240ms cubic-bezier(0.16, 1, 0.3, 1), opacity 180ms ease, border-color 200ms ease;
+  transition: margin-left 240ms cubic-bezier(0.16, 1, 0.3, 1), opacity 180ms ease;
+  will-change: margin-left, opacity;
   position: relative;
   user-select: none;
   z-index: 10;
   overflow: hidden;
 }
 
-/* Full Collapsed Sidebar: slides completely inside */
+/* Full Collapsed Sidebar: slides out cleanly without layout recalculation */
 .app-sidebar.collapsed {
-  width: 0 !important;
-  min-width: 0 !important;
-  border-right: 1px solid transparent !important;
+  margin-left: -260px !important;
   opacity: 0;
   pointer-events: none;
   visibility: hidden;
@@ -481,4 +480,54 @@
 /* When sidebar collapsed, floating toggle is active */
 .app-sidebar.collapsed ~ .app-center-view .floating-sidebar-toggle-btn {
   display: flex !important;
+}
+
+/* ── Daemon Offline / Reconnecting Banner ─────────────────────────────────── */
+.daemon-offline-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 8px 16px;
+  background-color: #ef4444;
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 500;
+  z-index: 1000;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  transition: transform var(--transition-normal), opacity var(--transition-normal);
+  will-change: transform, opacity;
+}
+
+.daemon-offline-banner.hidden {
+  display: none !important;
+}
+
+.offline-icon {
+  font-size: 14px;
+}
+
+.offline-msg {
+  flex: 0 1 auto;
+}
+
+.btn-offline-retry {
+  background: rgba(255, 255, 255, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  color: #ffffff;
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.btn-offline-retry:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.btn-offline-retry:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }

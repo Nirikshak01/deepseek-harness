@@ -15,7 +15,7 @@
 import { icons } from '../../components/ui/icons.js';
 import { store, USE_MOCKS } from '../../store/state.js';
 import { createChatInput } from './chatInput.js';
-import { createMessagesList } from './chatMessages.js';
+import { createMessagesList, renderMessageItem, updateAssistantMessageItem } from './chatMessages.js';
 import { mockConversations } from '../../mocks/conversationSamples.js';
 import { openDropdown } from '../../components/ui/dropdown.js';
 import { showToast } from '../../components/ui/toast.js';
@@ -23,6 +23,7 @@ import { listWorkspaces, pickAndCreateWorkspace } from '../../api/workspaces.js'
 import { createSession, loadSessionHistory, cancelSession, renameSession, saveSessionTitle } from '../../api/sessions.js';
 import { streamMux } from '../../api/stream.js';
 import { callRpc } from '../../api/rpc.js';
+import { dispatchNotification } from '../../utils/notifications.js';
 
 export function createChatArea() {
   const container = document.createElement('section');
@@ -291,21 +292,53 @@ export function createChatArea() {
     if (!activeId) return;
 
     const msgs = store.getMessages(activeId);
-    messagesScrollArea.innerHTML = '';
+    let listEl = messagesScrollArea.querySelector('.messages-list');
+    if (!listEl) {
+      messagesScrollArea.innerHTML = '';
+      listEl = document.createElement('div');
+      listEl.className = 'messages-list';
+      messagesScrollArea.appendChild(listEl);
+    }
 
-    const listEl = createMessagesList({
-      messages: msgs,
-      onRegenerate: (msg) => {
-        if (USE_MOCKS) {
-          simulateAssistantReply(activeId, 'Regenerating analysis and verification report...');
-        } else {
-          showToast('Regeneration requested', 'info');
+    const existingDomMap = new Map();
+    listEl.querySelectorAll(':scope > [data-msg-id]').forEach(el => {
+      existingDomMap.set(el.dataset.msgId, el);
+    });
+
+    const activeMsgIds = new Set();
+    const shouldAutoScroll = (messagesScrollArea.scrollHeight - messagesScrollArea.scrollTop - messagesScrollArea.clientHeight) < 140;
+
+    msgs.forEach((msg) => {
+      activeMsgIds.add(msg.id);
+      const existingEl = existingDomMap.get(msg.id);
+      if (existingEl) {
+        if (msg.role === 'assistant') {
+          updateAssistantMessageItem(existingEl, msg);
+        }
+      } else {
+        const newEl = renderMessageItem(msg, (_regenerateMsg) => {
+          if (USE_MOCKS) {
+            simulateAssistantReply(activeId, 'Regenerating analysis and verification report...');
+          } else {
+            showToast('Regeneration requested', 'info');
+          }
+        });
+        if (newEl) {
+          listEl.appendChild(newEl);
         }
       }
     });
 
-    messagesScrollArea.appendChild(listEl);
-    messagesScrollArea.scrollTop = messagesScrollArea.scrollHeight;
+    // Remove any items that are no longer in active msgs
+    existingDomMap.forEach((el, id) => {
+      if (!activeMsgIds.has(id)) {
+        el.remove();
+      }
+    });
+
+    if (shouldAutoScroll) {
+      messagesScrollArea.scrollTop = messagesScrollArea.scrollHeight;
+    }
   }
 
   function formatChatTitle(rawText) {
@@ -427,27 +460,55 @@ export function createChatArea() {
       activeFollowHandle = null;
     }
 
-    let renderScheduled = false;
-    const scheduleRender = () => {
-      if (!renderScheduled) {
-        renderScheduled = true;
-        requestAnimationFrame(() => {
-          renderScheduled = false;
+    let pendingTextDelta = '';
+    let pendingReasoningDelta = '';
+    let streamRafScheduled = false;
+
+    const flushStreamDeltas = () => {
+      streamRafScheduled = false;
+      let hasChanges = false;
+      if (pendingTextDelta) {
+        assistantMsg.text += pendingTextDelta;
+        pendingTextDelta = '';
+        hasChanges = true;
+      }
+      if (pendingReasoningDelta) {
+        assistantMsg.thinking += pendingReasoningDelta;
+        pendingReasoningDelta = '';
+        hasChanges = true;
+      }
+      if (hasChanges) {
+        const existingEl = messagesScrollArea.querySelector(`[data-msg-id="${assistantMsg.id}"]`);
+        if (existingEl) {
+          const shouldAutoScroll = (messagesScrollArea.scrollHeight - messagesScrollArea.scrollTop - messagesScrollArea.clientHeight) < 140;
+          updateAssistantMessageItem(existingEl, assistantMsg);
+          if (shouldAutoScroll) {
+            messagesScrollArea.scrollTop = messagesScrollArea.scrollHeight;
+          }
+        } else {
           renderActiveMessages();
-        });
+        }
+      }
+    };
+
+    const scheduleStreamBatch = () => {
+      if (!streamRafScheduled) {
+        streamRafScheduled = true;
+        requestAnimationFrame(flushStreamDeltas);
       }
     };
 
     activeFollowHandle = streamMux.followSession(sessionId, {
       onTextDelta: (delta) => {
-        assistantMsg.text += delta;
-        scheduleRender();
+        pendingTextDelta += delta;
+        scheduleStreamBatch();
       },
       onReasoningDelta: (delta) => {
-        assistantMsg.thinking += delta;
-        scheduleRender();
+        pendingReasoningDelta += delta;
+        scheduleStreamBatch();
       },
       onToolCall: (data) => {
+        if (streamRafScheduled) flushStreamDeltas();
         const toolName = data?.toolName || 'bash';
         const command = data?.args?.command || data?.args?.cmd || JSON.stringify(data?.args || {});
         let userQuestionData = null;
@@ -484,6 +545,12 @@ export function createChatArea() {
 
         if (userQuestionData) {
           assistantMsg.userQuestion = userQuestionData;
+          dispatchNotification({
+            title: 'DeepSeek Harness: Question for You',
+            body: userQuestionData.question || 'Please select an option to continue.',
+            targetCardId: assistantMsg.id,
+            type: 'questions'
+          });
         } else {
           assistantMsg.toolCall = {
             toolName,
@@ -492,17 +559,19 @@ export function createChatArea() {
             duration: 'running...'
           };
         }
-        scheduleRender();
+        renderActiveMessages();
       },
       onToolResult: (data) => {
+        if (streamRafScheduled) flushStreamDeltas();
         if (assistantMsg.toolCall) {
           assistantMsg.toolCall.output = data?.output || data?.stdout || data?.error || '';
           assistantMsg.toolCall.duration = data?.durationMs ? `${(data.durationMs / 1000).toFixed(1)}s` : '0.4s';
           assistantMsg.toolCall.isError = !!data?.error;
         }
-        scheduleRender();
+        renderActiveMessages();
       },
       onApprovalAsked: (data) => {
+        if (streamRafScheduled) flushStreamDeltas();
         assistantMsg.approvalRequest = {
           id: data.id,
           toolName: data.toolName,
@@ -516,9 +585,16 @@ export function createChatArea() {
             await callRpc('approval', 'decide', { requestId: data.id, outcome: 'rejected' });
           }
         };
-        scheduleRender();
+        dispatchNotification({
+          title: 'DeepSeek Harness: Approval Required',
+          body: `Command approval requested: ${data.command || data.toolName || 'Tool execution'}`,
+          targetCardId: assistantMsg.id,
+          type: 'approvals'
+        });
+        renderActiveMessages();
       },
       onQuestionAsked: (data) => {
+        if (streamRafScheduled) flushStreamDeltas();
         assistantMsg.userQuestion = {
           callId: data.callId,
           questionId: data.questionId || (data.questions && data.questions[0]?.id) || 'today_pick',
@@ -537,9 +613,18 @@ export function createChatArea() {
             }
           }
         };
-        scheduleRender();
+        dispatchNotification({
+          title: 'DeepSeek Harness: Question for You',
+          body: assistantMsg.userQuestion?.question || 'The agent is asking for your input to proceed.',
+          targetCardId: assistantMsg.id,
+          type: 'questions'
+        });
+        renderActiveMessages();
       },
       onTurnEnd: () => {
+        if (streamRafScheduled) {
+          flushStreamDeltas();
+        }
         assistantMsg.isStreaming = false;
         if (assistantMsg.toolCall && assistantMsg.toolCall.duration === 'running...') {
           assistantMsg.toolCall.duration = '0.4s';
@@ -548,8 +633,17 @@ export function createChatArea() {
         activeChatInput.setGenerating(false);
         store.saveState();
         renderActiveMessages();
+        dispatchNotification({
+          title: 'DeepSeek Harness: Task Completed',
+          body: 'DeepSeek agent has completed the requested task.',
+          targetCardId: assistantMsg.id,
+          type: 'taskAlerts'
+        });
       },
       onError: (err) => {
+        if (streamRafScheduled) {
+          flushStreamDeltas();
+        }
         assistantMsg.isStreaming = false;
         assistantMsg.error = {
           message: err.message || 'Stream error occurred',
@@ -561,6 +655,12 @@ export function createChatArea() {
         store.saveState();
         showToast(err.message || 'Stream error occurred', 'error');
         renderActiveMessages();
+        dispatchNotification({
+          title: 'DeepSeek Harness: Task Failed',
+          body: err.message || 'Stream error occurred during task execution.',
+          targetCardId: assistantMsg.id,
+          type: 'taskAlerts'
+        });
       }
     });
 
