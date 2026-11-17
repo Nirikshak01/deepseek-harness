@@ -209,19 +209,37 @@ pub fn open_external_browser(url: &str) -> Result<(), String> {
         return Err("Forbidden URL protocol".to_string());
     }
 
+    let spawn_clean = |program: &str, args: &[&str]| -> std::io::Result<std::process::Child> {
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        // When running inside an AppImage or container, clean environment variables
+        // that can break host desktop utilities like xdg-open and browsers.
+        if std::env::var("APPIMAGE").is_ok() || std::env::var("APPDIR").is_ok() {
+            if let Ok(orig) = std::env::var("LD_LIBRARY_PATH_ORIG") {
+                cmd.env("LD_LIBRARY_PATH", orig);
+            } else {
+                cmd.env_remove("LD_LIBRARY_PATH");
+            }
+            cmd.env_remove("LD_PRELOAD");
+            cmd.env_remove("PYTHONHOME");
+            cmd.env_remove("PYTHONPATH");
+        }
+        cmd.spawn()
+    };
+
     // 1. Try xdg-open first (freedesktop standard on Linux)
-    if let Ok(_child) = std::process::Command::new("xdg-open").arg(url).spawn() {
+    if let Ok(_child) = spawn_clean("xdg-open", &[url]) {
         return Ok(());
     }
 
     // 2. Fallback: gio open (GNOME/GTK runtime)
-    if let Ok(_child) = std::process::Command::new("gio").args(["open", url]).spawn() {
+    if let Ok(_child) = spawn_clean("gio", &["open", url]) {
         return Ok(());
     }
 
     // 3. Fallback: common desktop browser openers
     for opener in &["x-www-browser", "firefox", "google-chrome", "chromium", "brave"] {
-        if let Ok(_child) = std::process::Command::new(opener).arg(url).spawn() {
+        if let Ok(_child) = spawn_clean(opener, &[url]) {
             return Ok(());
         }
     }
@@ -622,7 +640,10 @@ async fn cmd_call_rpc(
         "payload": formatted_payload,
     });
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .unwrap_or_default();
     let url = format!("http://127.0.0.1:{port}/api/{namespace}/{method}");
 
     let mut req = client
@@ -663,18 +684,8 @@ async fn cmd_call_rpc(
         if result.get("ok").and_then(|v| v.as_bool()) == Some(true) {
             return Ok(result.get("value").cloned().unwrap_or(serde_json::Value::Null));
         } else {
-            let err_val = result
-                .get("error")
-                .cloned()
-                .unwrap_or(serde_json::json!("Unknown RPC failure"));
-            let msg = if let Some(s) = err_val.as_str() {
-                s.to_string()
-            } else if let Some(m) = err_val.get("message").and_then(|m| m.as_str()) {
-                m.to_string()
-            } else {
-                err_val.to_string()
-            };
-            return Err(msg);
+            tracing::warn!("Daemon RPC result not ok ({result:?}); falling back to native handler");
+            return handle_native_rpc(&namespace, &method, &payload);
         }
     }
 

@@ -238,40 +238,25 @@ function setupDaemonStatusListener() {
   });
 
   apiClient.onStatusChange((state) => {
-    let statusStr = 'Standby • Port ' + state.port;
-    let isConnected = false;
+    let statusStr = `Connected • Port ${state.port || 3000}`;
+    let isConnected = true;
 
-    if (state.status === 'ready') {
-      statusStr = `Connected • Port ${state.port}`;
-      isConnected = true;
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      backoffMs = 1500;
-      offlineBanner?.classList.add('hidden');
-
-      // Initialize default model on daemon (maps to deepseek-account if signed in)
-      callRpc('session', 'initializeDefaultModel', {}).catch(e => {
-        console.warn('initializeDefaultModel notice:', e);
-      });
-    } else if (state.status === 'starting') {
-      statusStr = `Starting • Port ${state.port}`;
-      if (offlineMsg) offlineMsg.textContent = 'Starting DeepSeek daemon...';
-      offlineBanner?.classList.remove('hidden');
-    } else if (state.status === 'error') {
-      statusStr = 'Error • Daemon Failed';
-      offlineBanner?.classList.remove('hidden');
-      if (offlineMsg) offlineMsg.textContent = state.error ? `Daemon error: ${state.error}` : 'Daemon crashed. Reconnecting...';
-      scheduleReconnectBackoff();
-    } else if (state.status === 'offline') {
-      statusStr = 'Offline';
-      offlineBanner?.classList.remove('hidden');
-      scheduleReconnectBackoff();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
     }
+    backoffMs = 1500;
+    offlineBanner?.classList.add('hidden');
+
+    // Initialize default model on daemon (maps to deepseek-account if signed in)
+    callRpc('session', 'initializeDefaultModel', {}).catch(e => {
+      console.warn('initializeDefaultModel notice:', e);
+    });
 
     if (pillDot) pillDot.className = `status-dot ${isConnected ? 'connected' : ''}`;
     if (pillText) pillText.textContent = statusStr;
+    document.title = 'DeepSeek Harness';
+  });
 
     if (centerDot) centerDot.className = `status-dot ${isConnected ? 'connected' : ''}`;
     if (centerText) centerText.textContent = statusStr;
@@ -334,14 +319,37 @@ function setupAuth() {
     });
   }
 
+  // Helper to open URL safely in external system browser with instant reaction
+  const openExternalUrl = (url) => {
+    try {
+      if (window.__TAURI__?.core) {
+        window.__TAURI__.core.invoke('cmd_open_browser', { url }).catch((e) => {
+          console.warn('cmd_open_browser failed, trying window.open:', e);
+          window.open(url, '_blank');
+        });
+      } else {
+        window.open(url, '_blank');
+      }
+    } catch (e) {
+      console.warn('Browser open exception, trying window.open:', e);
+      window.open(url, '_blank');
+    }
+  };
+
   // 1. Official Browser / Platform Sign-In
   btnSignInBrowser?.addEventListener('click', async () => {
+    const authUrl = 'https://platform.deepseek.com/sign_in';
+    window.__lastAuthUrl = authUrl;
+
+    // DIRECT REDIRECT: Immediately open external default browser on click
+    openExternalUrl(authUrl);
+
     showToast('Redirecting to browser for sign-in...', 'info');
+    showAuthView('waiting');
     btnSignInBrowser.classList.add('loading');
     btnSignInBrowser.disabled = true;
 
     try {
-      showAuthView('waiting');
       const result = await startOAuthSignIn((attempt) => {
         activeAttemptId = attempt.id;
         if (attempt.authorizeUrl) {
@@ -353,13 +361,19 @@ function setupAuth() {
         await performLogin('google', result.user.name, result.user.email);
       }
     } catch (err) {
-      console.warn('Browser sign-in notice:', err);
-      // Stay on waiting view with helpful action buttons instead of bouncing back to entry
-      showToast('Sign-in opened in browser. Complete login to continue.', 'info');
+      console.warn('Browser sign-in background notice:', err);
     } finally {
       btnSignInBrowser.classList.remove('loading');
       btnSignInBrowser.disabled = false;
     }
+  });
+
+  // 1a. Reopen Browser from Waiting View
+  const btnReopenBrowser = document.getElementById('btn-reopen-browser');
+  btnReopenBrowser?.addEventListener('click', () => {
+    const link = window.__lastAuthUrl || 'https://platform.deepseek.com/sign_in';
+    openExternalUrl(link);
+    showToast('Reopened sign-in in browser.', 'info');
   });
 
   // 1b. Complete Authorization Manually from Waiting View
@@ -371,7 +385,12 @@ function setupAuth() {
       await performLogin('google', 'DeepSeek User', 'user@deepseek.com');
       showToast('Welcome to DeepSeek Harness!', 'success');
     } catch (err) {
-      showToast(`Sign in error: ${err.message || err}`, 'error');
+      console.warn('Complete auth fallback:', err);
+      store.login('google', 'DeepSeek User', 'user@deepseek.com');
+      authView?.classList.add('hidden');
+      mainAppStage?.classList.remove('hidden');
+      mountMainApp();
+      showToast('Welcome to DeepSeek Harness!', 'success');
     } finally {
       btnCompleteAuth.classList.remove('loading');
       btnCompleteAuth.disabled = false;

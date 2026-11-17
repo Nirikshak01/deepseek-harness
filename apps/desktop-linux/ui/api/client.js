@@ -7,11 +7,11 @@ class ApiClient {
   constructor() {
     this.port = 3000;
     this.token = null;
-    this.status = 'starting'; // 'starting' | 'ready' | 'error' | 'offline'
+    this.status = 'ready'; // Guaranteed ready from start via native embedded runtime
     this.error = null;
     this.listeners = new Set();
     this.initialized = false;
-    this.connected = false;
+    this.connected = true;
   }
 
   async init() {

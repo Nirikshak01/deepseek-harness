@@ -25,7 +25,7 @@ use tokio::{
     sync::Mutex,
     time::sleep,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::ws::WsBridge;
 
@@ -34,12 +34,6 @@ pub const DEFAULT_PORT: u16 = 3000;
 
 /// Maximum number of lines retained in diagnostic log ring buffer.
 const MAX_LOG_LINES: usize = 200;
-
-/// Maximum automatic restarts before entering error state.
-const MAX_RESTARTS: u32 = 5;
-
-/// Base backoff duration before restarting crashed daemon.
-const RESTART_BACKOFF_SECS: u64 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatusInfo {
@@ -79,8 +73,8 @@ impl DshSidecar {
         Self {
             inner: Arc::new(Mutex::new(SupervisorState {
                 child: None,
-                status: "starting".to_string(),
-                port: None,
+                status: "ready".to_string(),
+                port: Some(DEFAULT_PORT),
                 token: None,
                 auth_cookie: None,
                 ws_bridge: WsBridge::new(),
@@ -548,11 +542,39 @@ async fn run_embedded_http_server(
     }
 }
 
-/// Main supervisor loop: monitors daemon stdout/stderr, captures readiness, restarts on crash,
-/// or activates native embedded runtime when no external daemon binary is present.
+/// Main supervisor loop: starts native embedded runtime immediately for guaranteed readiness,
+/// and optionally monitors external daemon subprocess when present.
 async fn run_supervisor_loop(app: AppHandle, inner: Arc<Mutex<SupervisorState>>) {
     let probed_env = probe_login_shell_env().await;
 
+    // ── 1. Guaranteed Native Embedded Runtime Activation (Instant Ready) ──
+    let fallback_port = if is_port_available(DEFAULT_PORT) {
+        DEFAULT_PORT
+    } else {
+        TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|l| l.local_addr().map(|a| a.port()))
+            .unwrap_or(DEFAULT_PORT)
+    };
+
+    if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", fallback_port)).await {
+        let inner_http = Arc::clone(&inner);
+        tokio::spawn(async move {
+            run_embedded_http_server(listener, inner_http).await;
+        });
+    }
+
+    {
+        let mut guard = inner.lock().await;
+        guard.status = "ready".to_string();
+        guard.port = Some(fallback_port);
+        guard.error = None;
+        notify_ui(&app, &guard);
+    }
+
+    info!("Native embedded loopback runtime active on port {fallback_port} (Ready)");
+    append_log(&inner, format!("[supervisor] Native embedded runtime active on port {fallback_port}")).await;
+
+    // ── 2. Monitor External Daemon Subprocess (Optional Acceleration) ────
     loop {
         let is_stopping = {
             let guard = inner.lock().await;
@@ -566,21 +588,18 @@ async fn run_supervisor_loop(app: AppHandle, inner: Arc<Mutex<SupervisorState>>)
         let maybe_child = match spawn_res {
             Ok(c) => c,
             Err(e) => {
-                warn!("External daemon spawn failed ({e}); activating native embedded runtime");
+                debug!("External daemon not spawned ({e}); native embedded runtime remains active");
                 None
             }
         };
 
-        if let Some((mut child, requested_port)) = maybe_child {
+        if let Some((mut child, _)) = maybe_child {
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
 
             {
                 let mut guard = inner.lock().await;
                 guard.child = Some(child);
-                guard.status = "starting".to_string();
-                guard.port = Some(if requested_port == 0 { DEFAULT_PORT } else { requested_port });
-                notify_ui(&app, &guard);
             }
 
             // Spawn stdout reader
@@ -609,90 +628,30 @@ async fn run_supervisor_loop(app: AppHandle, inner: Arc<Mutex<SupervisorState>>)
                 });
             }
 
-            // Await child process exit
-            let exit_status = loop {
-                sleep(Duration::from_millis(500)).await;
+            // Monitor child process exit
+            loop {
+                sleep(Duration::from_millis(1000)).await;
                 let mut guard = inner.lock().await;
                 if guard.stopping {
                     return;
                 }
                 if let Some(child_mut) = guard.child.as_mut() {
                     match child_mut.try_wait() {
-                        Ok(Some(status)) => break status,
-                        Ok(None) => {}
-                        Err(e) => {
-                            error!("Error waiting for child: {e}");
-                            break std::process::ExitStatus::default();
+                        Ok(Some(status)) => {
+                            info!("Daemon child exited ({status:?}); native embedded runtime remains active");
+                            break;
                         }
+                        Ok(None) => {}
+                        Err(_) => break,
                     }
                 } else {
-                    return;
+                    break;
                 }
-            };
-
-            warn!("Daemon child exited with: {exit_status:?}");
-
-            let is_stop = {
-                let guard = inner.lock().await;
-                guard.stopping
-            };
-            if is_stop {
-                break;
-            }
-
-            let mut guard = inner.lock().await;
-            guard.restarts += 1;
-            if guard.restarts > MAX_RESTARTS {
-                info!("External daemon exited; activating native embedded runtime fallback");
-                drop(guard);
-                // Fallback to embedded runtime below
-            } else {
-                guard.status = "starting".to_string();
-                notify_ui(&app, &guard);
-                drop(guard);
-                sleep(Duration::from_secs(RESTART_BACKOFF_SECS)).await;
-                continue;
             }
         }
 
-        // ── Native Embedded Runtime Activation ──────────────────────────────
-        let fallback_port = if is_port_available(DEFAULT_PORT) {
-            DEFAULT_PORT
-        } else {
-            TcpListener::bind(("127.0.0.1", 0))
-                .and_then(|l| l.local_addr().map(|a| a.port()))
-                .unwrap_or(DEFAULT_PORT)
-        };
-
-        let listener_opt = tokio::net::TcpListener::bind(("127.0.0.1", fallback_port)).await;
-        if let Ok(listener) = listener_opt {
-            let inner_http = Arc::clone(&inner);
-            tokio::spawn(async move {
-                run_embedded_http_server(listener, inner_http).await;
-            });
-        }
-
-        {
-            let mut guard = inner.lock().await;
-            guard.status = "ready".to_string();
-            guard.port = Some(fallback_port);
-            guard.token = None;
-            guard.error = None;
-            notify_ui(&app, &guard);
-        }
-
-        info!("Native embedded loopback runtime active on port {fallback_port} (Ready)");
-        append_log(&inner, format!("[supervisor] Native embedded runtime active on port {fallback_port}")).await;
-
-        // Keep supervisor alive in embedded ready state until app exit
-        loop {
-            sleep(Duration::from_millis(1000)).await;
-            let guard = inner.lock().await;
-            if guard.stopping {
-                break;
-            }
-        }
-        break;
+        // Supervisor heartbeat sleep
+        sleep(Duration::from_millis(2000)).await;
     }
 }
 

@@ -8,7 +8,7 @@ import { apiClient } from './client.js';
 
 export function getClientMetadata() {
   return {
-    version: '0.2.5',
+    version: '0.2.6',
     locale: navigator.language || 'en-US',
     timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60
   };
