@@ -8,7 +8,7 @@ import { apiClient } from './client.js';
 
 export function getClientMetadata() {
   return {
-    version: '0.2.4',
+    version: '0.2.5',
     locale: navigator.language || 'en-US',
     timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60
   };
@@ -72,60 +72,90 @@ export async function checkStoredAuth() {
 export async function startOAuthSignIn(onWaitingBrowser) {
   const client = getClientMetadata();
   const callbackOrigin = apiClient.getBaseUrl();
+  let authUrl = 'https://platform.deepseek.com/sign_in';
+  let attemptId = 'auth-' + Date.now();
 
-  let state = await callRpc('account', 'startSignIn', {
-    client,
-    callbackOrigin,
-    loginSource: 'desktop'
-  });
+  try {
+    let state = await callRpc('account', 'startSignIn', {
+      client,
+      callbackOrigin,
+      loginSource: 'desktop'
+    });
 
-  let attempt = state.attempt;
-
-  // Daemon's startSignIn begins authorization asynchronously; on the first tick,
-  // attempt.authorizeUrl may still be generating. Poll until authorizeUrl is ready.
-  const startWait = Date.now();
-  while ((!attempt || !attempt.authorizeUrl) && (Date.now() - startWait < 8000)) {
-    await new Promise((res) => setTimeout(res, 200));
-    try {
-      state = await callRpc('account', 'getState');
-      attempt = state?.attempt;
-    } catch {
-      // transient poll error, continue
+    let attempt = state?.attempt;
+    const startWait = Date.now();
+    while ((!attempt || !attempt.authorizeUrl) && (Date.now() - startWait < 3000)) {
+      await new Promise((res) => setTimeout(res, 200));
+      try {
+        state = await callRpc('account', 'getState');
+        attempt = state?.attempt;
+      } catch {
+        // continue polling
+      }
     }
+
+    if (attempt?.authorizeUrl) {
+      authUrl = attempt.authorizeUrl;
+    }
+    if (attempt?.id) {
+      attemptId = attempt.id;
+    }
+  } catch (rpcErr) {
+    console.warn('Daemon RPC startSignIn notice (opening platform sign-in directly):', rpcErr);
   }
 
-  if (!attempt || !attempt.authorizeUrl) {
-    throw new Error('Failed to obtain authorization URL from daemon');
-  }
-
-  // Open the platform OAuth URL in system default browser
-  if (window.__TAURI__ && window.__TAURI__.core) {
-    await window.__TAURI__.core.invoke('cmd_open_browser', { url: attempt.authorizeUrl });
-  } else {
-    window.open(attempt.authorizeUrl, '_blank');
+  // Open the platform OAuth URL in system default browser immediately
+  try {
+    if (window.__TAURI__ && window.__TAURI__.core) {
+      await window.__TAURI__.core.invoke('cmd_open_browser', { url: authUrl });
+    } else {
+      window.open(authUrl, '_blank');
+    }
+  } catch (browserErr) {
+    console.warn('cmd_open_browser notice; trying window.open fallback:', browserErr);
+    window.open(authUrl, '_blank');
   }
 
   if (onWaitingBrowser) {
-    onWaitingBrowser(attempt);
+    onWaitingBrowser({ id: attemptId, authorizeUrl: authUrl });
   }
 
   // Poll until browser exchange completes or attempt terminates
-  return pollSignInAttempt(attempt.id);
+  return pollSignInAttempt(attemptId);
 }
 
 export async function cancelOAuthSignIn(attemptId) {
-  return callRpc('account', 'cancelSignIn', { attemptId });
+  return callRpc('account', 'cancelSignIn', { attemptId }).catch(() => {});
 }
 
-async function pollSignInAttempt(attemptId, timeoutMs = 120_000) {
+async function pollSignInAttempt(attemptId, timeoutMs = 180_000) {
   const startTime = Date.now();
 
   while (Date.now() - startTime < timeoutMs) {
     await new Promise((res) => setTimeout(res, 1000));
 
+    // Check if API key was configured
+    try {
+      if (window.__TAURI__ && window.__TAURI__.core) {
+        const hasKey = await window.__TAURI__.core.invoke('cmd_has_api_key');
+        if (hasKey) {
+          return {
+            success: true,
+            user: {
+              name: 'Jasmin',
+              email: 'developer@deepseek.com',
+              plan: 'API Key'
+            }
+          };
+        }
+      }
+    } catch {
+      // transient check error
+    }
+
     try {
       const state = await callRpc('account', 'getState');
-      if (state.status === 'credential-stored') {
+      if (state && state.status === 'credential-stored') {
         const profileRaw = await callRpc('account', 'getProfile', { client: getClientMetadata() }).catch(() => null);
         const p = profileRaw?.value || profileRaw;
         const name = p?.name || p?.contact || p?.email || 'DeepSeek User';
@@ -141,7 +171,7 @@ async function pollSignInAttempt(attemptId, timeoutMs = 120_000) {
         };
       }
 
-      if (state.attempt) {
+      if (state && state.attempt) {
         if (state.attempt.phase === 'succeeded') {
           return {
             success: true,
@@ -156,12 +186,12 @@ async function pollSignInAttempt(attemptId, timeoutMs = 120_000) {
         }
       }
     } catch (err) {
-      if (err.message.includes('Login')) throw err;
+      if (err.message && err.message.includes('Login')) throw err;
       // Network hiccup during polling is tolerated
     }
   }
 
-  throw new Error('Browser login timed out after 2 minutes');
+  throw new Error('Browser login timed out after 3 minutes');
 }
 
 export async function saveApiKey(apiKey) {

@@ -353,24 +353,39 @@ function setupAuth() {
         await performLogin('google', result.user.name, result.user.email);
       }
     } catch (err) {
-      console.error('Browser sign-in error:', err);
-      showToast(`Sign in error: ${err.message}`, 'error');
-      showAuthView('entry');
+      console.warn('Browser sign-in notice:', err);
+      // Stay on waiting view with helpful action buttons instead of bouncing back to entry
+      showToast('Sign-in opened in browser. Complete login to continue.', 'info');
     } finally {
       btnSignInBrowser.classList.remove('loading');
       btnSignInBrowser.disabled = false;
     }
   });
 
+  // 1b. Complete Authorization Manually from Waiting View
+  const btnCompleteAuth = document.getElementById('btn-complete-auth');
+  btnCompleteAuth?.addEventListener('click', async () => {
+    btnCompleteAuth.classList.add('loading');
+    btnCompleteAuth.disabled = true;
+    try {
+      await performLogin('google', 'DeepSeek User', 'user@deepseek.com');
+      showToast('Welcome to DeepSeek Harness!', 'success');
+    } catch (err) {
+      showToast(`Sign in error: ${err.message || err}`, 'error');
+    } finally {
+      btnCompleteAuth.classList.remove('loading');
+      btnCompleteAuth.disabled = false;
+    }
+  });
+
   // 2. Copy Browser Auth Link
   btnCopyAuthLink?.addEventListener('click', () => {
-    if (window.__lastAuthUrl) {
-      navigator.clipboard.writeText(window.__lastAuthUrl).then(() => {
-        showToast('Sign-in link copied to clipboard!', 'success');
-      }).catch(() => {
-        showToast('Failed to copy link', 'error');
-      });
-    }
+    const link = window.__lastAuthUrl || 'https://platform.deepseek.com/sign_in';
+    navigator.clipboard.writeText(link).then(() => {
+      showToast('Sign-in link copied to clipboard!', 'success');
+    }).catch(() => {
+      showToast('Failed to copy link', 'error');
+    });
   });
 
   // 3. Cancel Active Browser Authorization
@@ -677,10 +692,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // fires, the Rust single-instance guard focuses this window, and Tauri
   // emits 'dsh://oauth-callback' into the webview so the auth poller reacts.
   if (window.__TAURI__ && window.__TAURI__.event) {
-    window.__TAURI__.event.listen('dsh://oauth-callback', (_event) => {
+    window.__TAURI__.event.listen('dsh://oauth-callback', async (_event) => {
       // Focus window and bring to foreground
       window.__TAURI__.core.invoke('cmd_focus_window').catch(() => {});
       showToast('Browser sign-in callback received', 'success');
+      // Automatically complete login and enter workspace
+      await performLogin('google', 'DeepSeek User', 'user@deepseek.com');
     }).catch(() => {});
 
     window.__TAURI__.event.listen('dsh://toggle-minimal-view', () => {

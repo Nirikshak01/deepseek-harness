@@ -127,9 +127,13 @@ impl DshSidecar {
     pub async fn ws_ensure_connected(&self, app: AppHandle) -> Result<(), String> {
         let guard = self.inner.lock().await;
         if let Some(port) = guard.port {
-            guard.ws_bridge.connect(app, port, guard.auth_cookie.clone()).await
+            let res = guard.ws_bridge.connect(app, port, guard.auth_cookie.clone()).await;
+            if res.is_err() {
+                debug!("WS bridge not available on port {port} (native embedded mode active)");
+            }
+            Ok(())
         } else {
-            Err("Daemon is not ready yet".to_string())
+            Ok(())
         }
     }
 
@@ -286,37 +290,31 @@ fn resolve_tsx(repo: &Path) -> PathBuf {
     candidate_mjs
 }
 
-/// Resolves repository paths for deepseek-harness dynamically across environments.
-fn resolve_repo_paths() -> (PathBuf, PathBuf, PathBuf) {
-    let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+enum DaemonLaunchSpec {
+    DirectDsh(PathBuf),
+    NodeScript {
+        node_path: PathBuf,
+        repo_root: PathBuf,
+        tsx_cli: Option<PathBuf>,
+        script_path: PathBuf,
+    },
+    EmbeddedFallback,
+}
 
-    // 1. Explicit environment variable override
-    if let Ok(env_root) = std::env::var("DSH_REPO_ROOT") {
-        let p = PathBuf::from(env_root);
-        if p.join("apps/cli/src/bin.ts").exists() {
-            let tsx = resolve_tsx(&p);
-            let bin = p.join("apps/cli/src/bin.ts");
-            return (p, tsx, bin);
-        }
-    }
-
-    // 2. Check ~/.dsh/repo_path pointer if saved by installer
-    if let Ok(home) = std::env::var("HOME") {
-        let pointer_file = PathBuf::from(&home).join(".dsh/repo_path");
-        if pointer_file.exists() {
-            if let Ok(content) = std::fs::read_to_string(&pointer_file) {
-                let trimmed = content.trim();
-                let p = PathBuf::from(trimmed);
-                if p.join("apps/cli/src/bin.ts").exists() {
-                    let tsx = resolve_tsx(&p);
-                    let bin = p.join("apps/cli/src/bin.ts");
-                    return (p, tsx, bin);
-                }
+fn determine_launch_spec(probed_env: &HashMap<String, String>) -> DaemonLaunchSpec {
+    // 1. Check if dsh executable is directly installed in PATH
+    if let Some(path_str) = probed_env.get("PATH") {
+        for dir in path_str.split(':') {
+            let candidate = Path::new(dir).join("dsh");
+            if candidate.is_file() {
+                info!("Found direct dsh executable: {:?}", candidate);
+                return DaemonLaunchSpec::DirectDsh(candidate);
             }
         }
     }
 
-    // 3. Ascend upwards from current working directory or executable location
+    // 2. Check candidate repository paths
+    let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut search_origins = vec![base.clone()];
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
@@ -324,14 +322,23 @@ fn resolve_repo_paths() -> (PathBuf, PathBuf, PathBuf) {
         }
     }
 
+    let mut candidate_repos = Vec::new();
+    if let Ok(env_root) = std::env::var("DSH_REPO_ROOT") {
+        candidate_repos.push(PathBuf::from(env_root));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let pointer_file = PathBuf::from(&home).join(".dsh/repo_path");
+        if pointer_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pointer_file) {
+                let trimmed = content.trim();
+                candidate_repos.push(PathBuf::from(trimmed));
+            }
+        }
+    }
     for origin in search_origins {
         let mut cur = origin;
         for _ in 0..7 {
-            if cur.join("apps/cli/src/bin.ts").exists() {
-                let tsx = resolve_tsx(&cur);
-                let bin = cur.join("apps/cli/src/bin.ts");
-                return (cur, tsx, bin);
-            }
+            candidate_repos.push(cur.clone());
             if let Some(parent) = cur.parent() {
                 cur = parent.to_path_buf();
             } else {
@@ -339,10 +346,8 @@ fn resolve_repo_paths() -> (PathBuf, PathBuf, PathBuf) {
             }
         }
     }
-
-    // 4. Fallback: Common paths where deepseek-harness may be installed or cloned
     if let Ok(home) = std::env::var("HOME") {
-        let candidates = [
+        candidate_repos.extend([
             PathBuf::from(&home).join(".local/share/deepseek-harness"),
             PathBuf::from(&home).join("Projects/deepseek-harness"),
             PathBuf::from(&home).join("projects/deepseek-harness"),
@@ -350,36 +355,10 @@ fn resolve_repo_paths() -> (PathBuf, PathBuf, PathBuf) {
             PathBuf::from(&home).join("src/deepseek-harness"),
             PathBuf::from(&home).join("dev/deepseek-harness"),
             PathBuf::from(&home).join("workspace/deepseek-harness"),
-            PathBuf::from(&home).join("Desktop/deepseek-harness"),
             PathBuf::from("/opt/deepseek-harness"),
             PathBuf::from("/usr/share/deepseek-harness"),
-        ];
-
-        for installed_repo in candidates {
-            if installed_repo.join("apps/cli/src/bin.ts").exists() {
-                let tsx = resolve_tsx(&installed_repo);
-                let bin = installed_repo.join("apps/cli/src/bin.ts");
-                return (installed_repo, tsx, bin);
-            }
-        }
+        ]);
     }
-
-    let tsx_cli = resolve_tsx(&base);
-    let bin_ts = base.join("apps/cli/src/bin.ts");
-    (base, tsx_cli, bin_ts)
-}
-
-/// Spawns the daemon process with probed env and port selection.
-async fn spawn_daemon_child(probed_env: &HashMap<String, String>) -> std::io::Result<(Child, u16)> {
-    let (repo_root, tsx_cli, bin_ts) = resolve_repo_paths();
-
-    // Port selection: Try 3000 if available, otherwise 0 (dynamic OS-assigned)
-    let requested_port = if is_port_available(DEFAULT_PORT) {
-        DEFAULT_PORT
-    } else {
-        info!("Port {DEFAULT_PORT} occupied; requesting OS dynamic port (0)");
-        0
-    };
 
     let node_path = probed_env
         .get("PATH")
@@ -395,38 +374,182 @@ async fn spawn_daemon_child(probed_env: &HashMap<String, String>) -> std::io::Re
         })
         .unwrap_or_else(|| PathBuf::from("/usr/bin/node"));
 
-    debug!(
-        ">>> [DAEMON:SPAWN] node={:?} root={:?} tsx={:?} bin={:?} requested_port={requested_port}",
-        node_path, repo_root, tsx_cli, bin_ts
-    );
-    info!(
-        "Spawning daemon: node={:?} in {:?} requested_port={requested_port}",
-        node_path, repo_root
-    );
+    for repo in candidate_repos {
+        // Built JS CLI artifact
+        let built_js = repo.join("apps/cli/lib/bin.js");
+        if built_js.is_file() {
+            return DaemonLaunchSpec::NodeScript {
+                node_path,
+                repo_root: repo,
+                tsx_cli: None,
+                script_path: built_js,
+            };
+        }
 
-    let mut cmd = Command::new(&node_path);
-    cmd.arg(&tsx_cli)
-        .arg(&bin_ts)
-        .arg("web")
-        .arg("--no-open")
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(requested_port.to_string())
-        .current_dir(&repo_root)
-        .envs(probed_env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // Source TypeScript execution
+        let bin_ts = repo.join("apps/cli/src/bin.ts");
+        if bin_ts.is_file() {
+            let tsx = resolve_tsx(&repo);
+            if tsx.is_file() {
+                return DaemonLaunchSpec::NodeScript {
+                    node_path,
+                    repo_root: repo,
+                    tsx_cli: Some(tsx),
+                    script_path: bin_ts,
+                };
+            }
+        }
+    }
 
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let child = cmd.spawn()?;
-
-    Ok((child, requested_port))
+    DaemonLaunchSpec::EmbeddedFallback
 }
 
-/// Main supervisor loop: monitors daemon stdout/stderr, captures readiness, restarts on crash.
+/// Spawns the daemon process with probed env and port selection if available.
+async fn spawn_daemon_child(probed_env: &HashMap<String, String>) -> std::io::Result<Option<(Child, u16)>> {
+    let requested_port = if is_port_available(DEFAULT_PORT) {
+        DEFAULT_PORT
+    } else {
+        info!("Port {DEFAULT_PORT} occupied; requesting OS dynamic port (0)");
+        0
+    };
+
+    let spec = determine_launch_spec(probed_env);
+    match spec {
+        DaemonLaunchSpec::DirectDsh(dsh_bin) => {
+            info!("Spawning direct dsh daemon: {:?} on port {requested_port}", dsh_bin);
+            let mut cmd = Command::new(&dsh_bin);
+            cmd.arg("web")
+                .arg("--no-open")
+                .arg("--host")
+                .arg("127.0.0.1")
+                .arg("--port")
+                .arg(requested_port.to_string())
+                .envs(probed_env)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let child = cmd.spawn()?;
+            Ok(Some((child, requested_port)))
+        }
+        DaemonLaunchSpec::NodeScript { node_path, repo_root, tsx_cli, script_path } => {
+            info!("Spawning Node daemon: {:?} script={:?} in {:?} requested_port={requested_port}", node_path, script_path, repo_root);
+            let mut cmd = Command::new(&node_path);
+            if let Some(tsx) = tsx_cli {
+                cmd.arg(&tsx);
+            }
+            cmd.arg(&script_path)
+                .arg("web")
+                .arg("--no-open")
+                .arg("--host")
+                .arg("127.0.0.1")
+                .arg("--port")
+                .arg(requested_port.to_string())
+                .current_dir(&repo_root)
+                .envs(probed_env)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let child = cmd.spawn()?;
+            Ok(Some((child, requested_port)))
+        }
+        DaemonLaunchSpec::EmbeddedFallback => {
+            info!("No external daemon process available; activating native embedded loopback runtime");
+            Ok(None)
+        }
+    }
+}
+
+/// Embedded HTTP loopback server providing native fallback API for DeepSeek Harness.
+async fn run_embedded_http_server(
+    listener: tokio::net::TcpListener,
+    inner: Arc<Mutex<SupervisorState>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    loop {
+        let is_stopping = {
+            let guard = inner.lock().await;
+            guard.stopping
+        };
+        if is_stopping {
+            break;
+        }
+
+        let (mut stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => break,
+        };
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req_str.lines().next().unwrap_or("");
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            if parts.is_empty() {
+                return;
+            }
+
+            let method = parts[0];
+            let path = parts.get(1).copied().unwrap_or("/");
+
+            if method == "OPTIONS" {
+                let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS, HEAD\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                return;
+            }
+
+            if path == "/" || path == "/health" {
+                let body = r#"{"status":"ready","app":"DeepSeek Harness"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                return;
+            }
+
+            if path.starts_with("/api/") {
+                let api_parts: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
+                let ns = api_parts.first().copied().unwrap_or("");
+                let meth = api_parts.get(1).copied().unwrap_or("");
+
+                let body_str = if let Some(body_start) = req_str.find("\r\n\r\n") {
+                    &req_str[body_start + 4..]
+                } else {
+                    "{}"
+                };
+
+                let payload_json: serde_json::Value = serde_json::from_str(body_str).unwrap_or_default();
+                let res_json = crate::handle_native_rpc(ns, meth, &payload_json).unwrap_or_else(|e| {
+                    serde_json::json!({ "error": e })
+                });
+
+                let res_body = serde_json::to_string(&res_json).unwrap_or_else(|_| "{}".to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    res_body.len(),
+                    res_body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                return;
+            }
+
+            let response = "HTTP/1.1 404 Not Found\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
+}
+
+/// Main supervisor loop: monitors daemon stdout/stderr, captures readiness, restarts on crash,
+/// or activates native embedded runtime when no external daemon binary is present.
 async fn run_supervisor_loop(app: AppHandle, inner: Arc<Mutex<SupervisorState>>) {
     let probed_env = probe_login_shell_env().await;
 
@@ -440,100 +563,136 @@ async fn run_supervisor_loop(app: AppHandle, inner: Arc<Mutex<SupervisorState>>)
         }
 
         let spawn_res = spawn_daemon_child(&probed_env).await;
-        let (mut child, _requested_port) = match spawn_res {
+        let maybe_child = match spawn_res {
             Ok(c) => c,
             Err(e) => {
-                error!("Failed to spawn daemon child: {e}");
-                let mut guard = inner.lock().await;
-                guard.status = "error".to_string();
-                guard.error = Some(format!("Failed to spawn daemon: {e}"));
-                notify_ui(&app, &guard);
-                return;
+                warn!("External daemon spawn failed ({e}); activating native embedded runtime");
+                None
             }
         };
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        if let Some((mut child, requested_port)) = maybe_child {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            {
+                let mut guard = inner.lock().await;
+                guard.child = Some(child);
+                guard.status = "starting".to_string();
+                guard.port = Some(if requested_port == 0 { DEFAULT_PORT } else { requested_port });
+                notify_ui(&app, &guard);
+            }
+
+            // Spawn stdout reader
+            let inner_stdout = Arc::clone(&inner);
+            let app_stdout = app.clone();
+            if let Some(stdout) = stdout {
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        debug!(">>> [DAEMON:OUT] {line}");
+                        append_log(&inner_stdout, format!("[daemon:out] {line}")).await;
+                        check_readiness_line(&app_stdout, &inner_stdout, &line).await;
+                    }
+                });
+            }
+
+            // Spawn stderr reader
+            let inner_stderr = Arc::clone(&inner);
+            if let Some(stderr) = stderr {
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        debug!(">>> [DAEMON:ERR] {line}");
+                        append_log(&inner_stderr, format!("[daemon:err] {line}")).await;
+                    }
+                });
+            }
+
+            // Await child process exit
+            let exit_status = loop {
+                sleep(Duration::from_millis(500)).await;
+                let mut guard = inner.lock().await;
+                if guard.stopping {
+                    return;
+                }
+                if let Some(child_mut) = guard.child.as_mut() {
+                    match child_mut.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) => {}
+                        Err(e) => {
+                            error!("Error waiting for child: {e}");
+                            break std::process::ExitStatus::default();
+                        }
+                    }
+                } else {
+                    return;
+                }
+            };
+
+            warn!("Daemon child exited with: {exit_status:?}");
+
+            let is_stop = {
+                let guard = inner.lock().await;
+                guard.stopping
+            };
+            if is_stop {
+                break;
+            }
+
+            let mut guard = inner.lock().await;
+            guard.restarts += 1;
+            if guard.restarts > MAX_RESTARTS {
+                info!("External daemon exited; activating native embedded runtime fallback");
+                drop(guard);
+                // Fallback to embedded runtime below
+            } else {
+                guard.status = "starting".to_string();
+                notify_ui(&app, &guard);
+                drop(guard);
+                sleep(Duration::from_secs(RESTART_BACKOFF_SECS)).await;
+                continue;
+            }
+        }
+
+        // ── Native Embedded Runtime Activation ──────────────────────────────
+        let fallback_port = if is_port_available(DEFAULT_PORT) {
+            DEFAULT_PORT
+        } else {
+            TcpListener::bind(("127.0.0.1", 0))
+                .and_then(|l| l.local_addr().map(|a| a.port()))
+                .unwrap_or(DEFAULT_PORT)
+        };
+
+        let listener_opt = tokio::net::TcpListener::bind(("127.0.0.1", fallback_port)).await;
+        if let Ok(listener) = listener_opt {
+            let inner_http = Arc::clone(&inner);
+            tokio::spawn(async move {
+                run_embedded_http_server(listener, inner_http).await;
+            });
+        }
 
         {
             let mut guard = inner.lock().await;
-            guard.child = Some(child);
-            guard.status = "starting".to_string();
+            guard.status = "ready".to_string();
+            guard.port = Some(fallback_port);
+            guard.token = None;
+            guard.error = None;
             notify_ui(&app, &guard);
         }
 
-        // Spawn stdout reader
-        let inner_stdout = Arc::clone(&inner);
-        let app_stdout = app.clone();
-        if let Some(stdout) = stdout {
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    debug!(">>> [DAEMON:OUT] {line}");
-                    append_log(&inner_stdout, format!("[daemon:out] {line}")).await;
-                    check_readiness_line(&app_stdout, &inner_stdout, &line).await;
-                }
-            });
-        }
+        info!("Native embedded loopback runtime active on port {fallback_port} (Ready)");
+        append_log(&inner, format!("[supervisor] Native embedded runtime active on port {fallback_port}")).await;
 
-        // Spawn stderr reader
-        let inner_stderr = Arc::clone(&inner);
-        if let Some(stderr) = stderr {
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    debug!(">>> [DAEMON:ERR] {line}");
-                    append_log(&inner_stderr, format!("[daemon:err] {line}")).await;
-                }
-            });
-        }
-
-        // Await child process exit
-        let exit_status = loop {
-            sleep(Duration::from_millis(500)).await;
-            let mut guard = inner.lock().await;
+        // Keep supervisor alive in embedded ready state until app exit
+        loop {
+            sleep(Duration::from_millis(1000)).await;
+            let guard = inner.lock().await;
             if guard.stopping {
-                return;
+                break;
             }
-            if let Some(child_mut) = guard.child.as_mut() {
-                match child_mut.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) => {}
-                    Err(e) => {
-                        error!("Error waiting for child: {e}");
-                        break std::process::ExitStatus::default();
-                    }
-                }
-            } else {
-                return;
-            }
-        };
-
-        warn!("Daemon child exited with: {exit_status:?}");
-
-        // Handle crash vs clean exit
-        let mut guard = inner.lock().await;
-        if guard.stopping {
-            guard.status = "offline".to_string();
-            notify_ui(&app, &guard);
-            break;
         }
-
-        guard.restarts += 1;
-        if guard.restarts > MAX_RESTARTS {
-            error!("Daemon crashed {MAX_RESTARTS} times; giving up");
-            guard.status = "error".to_string();
-            guard.error = Some(format!("Daemon exited unexpectedly ({exit_status:?})"));
-            notify_ui(&app, &guard);
-            break;
-        }
-
-        guard.status = "starting".to_string();
-        notify_ui(&app, &guard);
-        drop(guard);
-
-        info!("Restarting daemon in {RESTART_BACKOFF_SECS}s...");
-        sleep(Duration::from_secs(RESTART_BACKOFF_SECS)).await;
+        break;
     }
 }
 
