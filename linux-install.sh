@@ -196,22 +196,20 @@ elif [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../apps/desktop-linux/src-tauri/C
 elif [ -f "$(pwd)/apps/desktop-linux/src-tauri/Cargo.toml" ]; then
   TARGET_REPO_DIR="$(pwd)"
   log_info "Running from current working directory: $TARGET_REPO_DIR"
+elif [ -f "$HOME/deepseek-harness/apps/desktop-linux/src-tauri/Cargo.toml" ]; then
+  TARGET_REPO_DIR="$HOME/deepseek-harness"
+  log_info "Detected local workspace repository: $TARGET_REPO_DIR"
 else
   TARGET_REPO_DIR="$HOME/.local/share/deepseek-harness"
   log_info "Preparing DeepSeek Harness source in $TARGET_REPO_DIR..."
   if [ -d "$TARGET_REPO_DIR/.git" ]; then
-    log_info "Updating existing repository..."
-    git -C "$TARGET_REPO_DIR" pull --ff-only || true
+    log_info "Updating repository at $TARGET_REPO_DIR..."
+    git -C "$TARGET_REPO_DIR" fetch https://github.com/jasmin1727/deepseek-harness.git master || true
+    git -C "$TARGET_REPO_DIR" reset --hard FETCH_HEAD || true
   else
     mkdir -p "$(dirname "$TARGET_REPO_DIR")"
-    PRIMARY_REPO="${DSH_REPO_URL:-https://github.com/deepseek-ai/deepseek-harness.git}"
-    log_info "Cloning repository from $PRIMARY_REPO..."
-    if ! git clone --depth 1 "$PRIMARY_REPO" "$TARGET_REPO_DIR" 2>/dev/null || [ ! -d "$TARGET_REPO_DIR/apps/desktop-linux" ]; then
-      log_warn "Upstream repository does not contain apps/desktop-linux yet (pre-merge)."
-      log_info "Falling back to pull request source (https://github.com/jasmin1727/deepseek-harness.git)..."
-      rm -rf "$TARGET_REPO_DIR"
-      git clone --depth 1 https://github.com/jasmin1727/deepseek-harness.git "$TARGET_REPO_DIR"
-    fi
+    rm -rf "$TARGET_REPO_DIR"
+    git clone --depth 1 https://github.com/jasmin1727/deepseek-harness.git "$TARGET_REPO_DIR"
   fi
 fi
 
@@ -265,6 +263,12 @@ log_success "Release binary built successfully ($(du -h "$BINARY_SOURCE" | cut -
 # Step 8: Install Executable to ~/.local/bin
 INSTALL_BIN_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_BIN_DIR"
+
+# Terminate previous instances and remove socket so the new build takes effect immediately
+pkill -f "deepseek-harness" 2>/dev/null || true
+pkill -f "dsh-desktop" 2>/dev/null || true
+rm -f /tmp/dsh-desktop-linux.sock 2>/dev/null || true
+
 cp "$BINARY_SOURCE" "$INSTALL_BIN_DIR/deepseek-harness"
 chmod +x "$INSTALL_BIN_DIR/deepseek-harness"
 ln -sf "$INSTALL_BIN_DIR/deepseek-harness" "$INSTALL_BIN_DIR/dsh-desktop"
