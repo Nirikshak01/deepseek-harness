@@ -258,14 +258,6 @@ function setupDaemonStatusListener() {
     document.title = 'DeepSeek Harness';
   });
 
-    if (centerDot) centerDot.className = `status-dot ${isConnected ? 'connected' : ''}`;
-    if (centerText) centerText.textContent = statusStr;
-
-    if (state.status === 'error' && state.error) {
-      showToast(`Daemon notice: ${state.error}`, 'error');
-    }
-  });
-
   if (apiClient.status === 'ready') {
     callRpc('session', 'initializeDefaultModel', {}).catch(e => {
       console.warn('initializeDefaultModel notice:', e);

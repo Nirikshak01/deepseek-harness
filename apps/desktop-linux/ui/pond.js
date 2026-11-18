@@ -369,4 +369,11 @@ function initPond(canvasId, containerId) {
 
 if (typeof window !== 'undefined') {
   window.initPond = initPond;
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      initPond('pond-canvas', 'auth-view');
+    });
+  } else {
+    initPond('pond-canvas', 'auth-view');
+  }
 }
