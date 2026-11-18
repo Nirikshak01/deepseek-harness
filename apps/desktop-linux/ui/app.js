@@ -328,15 +328,19 @@ function setupAuth() {
     }
   };
 
+  // Listen for official OAuth completion from Tauri backend
+  if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen('dsh://oauth-success', async (event) => {
+      console.log('OAuth completion event received from backend:', event.payload);
+      const user = event.payload?.user || { name: 'DeepSeek User', email: 'user@deepseek.com' };
+      showToast(`Welcome, ${user.name}!`, 'success');
+      await performLogin('google', user.name, user.email);
+    });
+  }
+
   // 1. Official Browser / Platform Sign-In
   btnSignInBrowser?.addEventListener('click', async () => {
-    const authUrl = 'https://platform.deepseek.com/sign_in';
-    window.__lastAuthUrl = authUrl;
-
-    // DIRECT REDIRECT: Immediately open external default browser on click
-    openExternalUrl(authUrl);
-
-    showToast('Redirecting to browser for sign-in...', 'info');
+    showToast('Connecting to DeepSeek Platform for authorization...', 'info');
     showAuthView('waiting');
     btnSignInBrowser.classList.add('loading');
     btnSignInBrowser.disabled = true;
@@ -363,9 +367,9 @@ function setupAuth() {
   // 1a. Reopen Browser from Waiting View
   const btnReopenBrowser = document.getElementById('btn-reopen-browser');
   btnReopenBrowser?.addEventListener('click', () => {
-    const link = window.__lastAuthUrl || 'https://platform.deepseek.com/sign_in';
+    const link = window.__lastAuthUrl || 'https://platform.deepseek.com/dsh/authorize';
     openExternalUrl(link);
-    showToast('Reopened sign-in in browser.', 'info');
+    showToast('Reopened authorization page in browser.', 'info');
   });
 
   // 1b. Complete Authorization Manually from Waiting View
@@ -458,6 +462,7 @@ function setupAuth() {
 
 // ── Mount Main Application ───────────────────────────────────────────────────
 function mountMainApp() {
+  if (window.__stopPond) window.__stopPond();
   const mainAppStage = document.getElementById('main-app-stage');
   if (!mainAppStage) return;
 
@@ -480,6 +485,7 @@ function mountMainApp() {
 
       mainAppStage.classList.add('hidden');
       authView?.classList.remove('hidden');
+      if (window.__startPond) window.__startPond();
 
       if (titlebarScope) {
         titlebarScope.textContent = 'Workspace';

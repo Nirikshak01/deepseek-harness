@@ -53,13 +53,16 @@ function initPond(canvasId, containerId) {
   let last = 0;
   let wLast = 0;
 
+  let running = true;
+  let rafId = null;
+
   function resize() {
     const rect = container.getBoundingClientRect();
     W = Math.max(260, Math.floor(rect.width));
     H = Math.max(300, Math.floor(rect.height));
     dpr = Math.min(window.devicePixelRatio || 1, 2);
-    cw = W < 600 ? 6 : 7;
-    ch = W < 600 ? 10 : 12;
+    cw = W < 600 ? 8 : 11;
+    ch = W < 600 ? 14 : 18;
     fs = ch * 0.9;
     cols = Math.ceil(W / cw);
     rows = Math.ceil(H / ch);
@@ -75,8 +78,8 @@ function initPond(canvasId, containerId) {
       c.height = rows;
     }
 
-    base = Math.max(11, Math.min(20, W / 75));
-    const want = Math.round(Math.max(4, Math.min(8, (W * H) / 120000)));
+    base = Math.max(12, Math.min(22, W / 70));
+    const want = Math.round(Math.max(3, Math.min(6, (W * H) / 140000)));
     while (fish.length < want) fish.push(mk(fish.length));
     fish.length = want;
     for (const f of fish) {
@@ -311,11 +314,16 @@ function initPond(canvasId, containerId) {
   }
 
   function frame(ts) {
+    if (!running) return;
+    if (cv.offsetParent === null) {
+      rafId = requestAnimationFrame(frame);
+      return;
+    }
     const t = ts / 1000;
     const dt = Math.min(0.05, t - last || 0.016);
     last = t;
     for (const f of fish) update(f, dt, t);
-    if (t - wLast > 0.032) {
+    if (t - wLast > 0.08) {
       drawWater(t);
       wLast = t;
     }
@@ -337,8 +345,21 @@ function initPond(canvasId, containerId) {
     }
     blit(sx, true);
     blit(fx, false);
-    requestAnimationFrame(frame);
+    rafId = requestAnimationFrame(frame);
   }
+
+  window.__stopPond = () => {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+  };
+
+  window.__startPond = () => {
+    if (!running) {
+      running = true;
+      last = performance.now() / 1000;
+      rafId = requestAnimationFrame(frame);
+    }
+  };
 
   function poke(e) {
     const rect = cv.getBoundingClientRect();

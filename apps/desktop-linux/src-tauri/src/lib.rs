@@ -1,5 +1,7 @@
 //! App builder — wires up Tauri plugins, state, sidecar, tray, and IPC commands.
 
+pub mod chat;
+pub mod oauth;
 pub mod sidecar;
 pub mod tray;
 pub mod ws;
@@ -111,11 +113,41 @@ pub fn run() {
                                 if let Ok(args_vec) = serde_json::from_str::<Vec<String>>(&trimmed) {
                                     for arg in args_vec {
                                         if arg.starts_with("dsh://") {
-                                            let _ = win.emit("dsh://oauth-callback", arg);
+                                            let _ = win.emit("dsh://oauth-callback", &arg);
+                                            if arg.contains("code=") {
+                                                let query = arg.split_once('?').map(|(_, q)| q).unwrap_or("");
+                                                let mut code = String::new();
+                                                let mut state = String::new();
+                                                for pair in query.split('&') {
+                                                    if let Some((k, v)) = pair.split_once('=') {
+                                                        if k == "code" { code = v.to_string(); }
+                                                        else if k == "state" { state = v.to_string(); }
+                                                    }
+                                                }
+                                                let h = handle_socket.clone();
+                                                tokio::spawn(async move {
+                                                    let _ = crate::oauth::exchange_official_code(&code, &state, &h).await;
+                                                });
+                                            }
                                         }
                                     }
                                 } else if trimmed.starts_with("dsh://") {
                                     let _ = win.emit("dsh://oauth-callback", &trimmed);
+                                    if trimmed.contains("code=") {
+                                        let query = trimmed.split_once('?').map(|(_, q)| q).unwrap_or("");
+                                        let mut code = String::new();
+                                        let mut state = String::new();
+                                        for pair in query.split('&') {
+                                            if let Some((k, v)) = pair.split_once('=') {
+                                                if k == "code" { code = v.to_string(); }
+                                                else if k == "state" { state = v.to_string(); }
+                                            }
+                                        }
+                                        let h = handle_socket.clone();
+                                        tokio::spawn(async move {
+                                            let _ = crate::oauth::exchange_official_code(&code, &state, &h).await;
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -129,9 +161,24 @@ pub fn run() {
             app.listen("deep-link://new-url", move |event| {
                 info!("Deep-link received: {:?}", event.payload());
                 focus_main_window(&handle2);
-                // Notify the webview that an oauth callback arrived
+                let payload_str = event.payload().to_string();
                 if let Some(win) = handle2.get_webview_window("main") {
-                    let _ = win.emit("dsh://oauth-callback", event.payload());
+                    let _ = win.emit("dsh://oauth-callback", &payload_str);
+                }
+                if payload_str.contains("code=") {
+                    let query = payload_str.split_once('?').map(|(_, q)| q).unwrap_or("");
+                    let mut code = String::new();
+                    let mut state = String::new();
+                    for pair in query.split('&') {
+                        if let Some((k, v)) = pair.split_once('=') {
+                            if k == "code" { code = v.trim_matches('"').to_string(); }
+                            else if k == "state" { state = v.trim_matches('"').to_string(); }
+                        }
+                    }
+                    let h = handle2.clone();
+                    tokio::spawn(async move {
+                        let _ = crate::oauth::exchange_official_code(&code, &state, &h).await;
+                    });
                 }
             });
 
@@ -457,12 +504,13 @@ async fn cmd_clear_api_key() -> Result<(), String> {
 }
 
 /// Native fallback RPC handler when the Node sidecar daemon is not running.
-/// Ensures all essential functionality (Sign-in, Workspace, Session, Models)
+/// Ensures all essential functionality (Sign-in, Workspace, Session, Models, Prompting)
 /// functions gracefully without errors on any Linux system.
-pub fn handle_native_rpc(
+pub async fn handle_native_rpc(
     namespace: &str,
     method: &str,
     payload: &serde_json::Value,
+    app: Option<&AppHandle>,
 ) -> Result<serde_json::Value, String> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -471,24 +519,12 @@ pub fn handle_native_rpc(
 
     match (namespace, method) {
         ("account", "startSignIn") => {
-            let attempt_id = format!("attempt-{now_ms}");
-            let authorize_url = "https://platform.deepseek.com/sign_in".to_string();
-            // Automatically launch system browser immediately
-            let _ = open_external_browser(&authorize_url);
-            Ok(serde_json::json!({
-                "status": "signed-out",
-                "links": {
-                    "usageUrl": "https://platform.deepseek.com/usage",
-                    "topUpUrl": "https://platform.deepseek.com/top_up"
-                },
-                "attempt": {
-                    "id": attempt_id,
-                    "phase": "waiting-browser",
-                    "authorizeUrl": authorize_url
-                }
-            }))
+            // Official DeepSeek PKCE Authentication initiation
+            let port = 3000;
+            crate::oauth::start_official_signin(port).await
         }
         ("account", "getState") => {
+            let has_account = crate::oauth::read_stored_account_grant().is_some();
             let cred_file = get_user_home().join(".dsh/.credentials.yaml");
             let has_key = if cred_file.exists() {
                 let content = std::fs::read_to_string(&cred_file).unwrap_or_default();
@@ -497,7 +533,7 @@ pub fn handle_native_rpc(
                 false
             };
 
-            if has_key {
+            if has_account || has_key {
                 Ok(serde_json::json!({
                     "status": "credential-stored",
                     "links": {
@@ -518,13 +554,23 @@ pub fn handle_native_rpc(
             }
         }
         ("account", "getProfile") => {
-            Ok(serde_json::json!({
-                "value": {
-                    "name": "DeepSeek User",
-                    "email": "user@deepseek.com",
-                    "plan": "Pro"
-                }
-            }))
+            if let Some((_, name, email)) = crate::oauth::read_stored_account_grant() {
+                Ok(serde_json::json!({
+                    "value": {
+                        "name": name,
+                        "email": email,
+                        "plan": "Pro"
+                    }
+                }))
+            } else {
+                Ok(serde_json::json!({
+                    "value": {
+                        "name": "DeepSeek User",
+                        "email": "user@deepseek.com",
+                        "plan": "Pro"
+                    }
+                }))
+            }
         }
         ("account", "getBalance") => {
             Ok(serde_json::json!({
@@ -535,6 +581,31 @@ pub fn handle_native_rpc(
             }))
         }
         ("account", "signOut") | ("account", "cancelSignIn") => {
+            let cred_file = get_user_home().join(".dsh/.credentials.yaml");
+            if cred_file.exists() {
+                if let Ok(content) = std::fs::read_to_string(&cred_file) {
+                    let mut cleaned = Vec::new();
+                    let mut skipping = false;
+                    for line in content.lines() {
+                        if line.contains("deepseek-account-platform/grant:") {
+                            skipping = true;
+                            continue;
+                        }
+                        if skipping {
+                            if line.starts_with("  ") && !line.starts_with("  deepseek-account-platform/") && !line.starts_with("    ") {
+                                skipping = false;
+                                cleaned.push(line.to_string());
+                            } else if !line.starts_with(' ') && !line.is_empty() {
+                                skipping = false;
+                                cleaned.push(line.to_string());
+                            }
+                        } else {
+                            cleaned.push(line.to_string());
+                        }
+                    }
+                    let _ = std::fs::write(&cred_file, cleaned.join("\n"));
+                }
+            }
             Ok(serde_json::json!({
                 "status": "signed-out",
                 "attempt": null
@@ -597,6 +668,33 @@ pub fn handle_native_rpc(
                 ]
             }))
         }
+        ("session", "prompt") => {
+            let prompt_text = payload
+                .get("args")
+                .and_then(|a| a.get("request"))
+                .or_else(|| payload.get("request"))
+                .and_then(|r| r.get("content"))
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("Hello")
+                .to_string();
+
+            let session_id = payload
+                .get("args")
+                .and_then(|a| a.get("request"))
+                .or_else(|| payload.get("request"))
+                .and_then(|r| r.get("sessionId"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("sess-default")
+                .to_string();
+
+            if let Some(app_handle) = app {
+                crate::chat::spawn_chat_stream(prompt_text, session_id, None, (*app_handle).clone());
+            }
+            Ok(serde_json::json!({ "ok": true }))
+        }
         _ => Ok(serde_json::json!({ "ok": true })),
     }
 }
@@ -606,15 +704,23 @@ pub fn handle_native_rpc(
 /// When external daemon is not active, falls back gracefully to native RPC handler.
 #[tauri::command]
 async fn cmd_call_rpc(
+    app: AppHandle,
     sidecar: State<'_, DshSidecar>,
     namespace: String,
     method: String,
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    if namespace == "account" {
+        return handle_native_rpc(&namespace, &method, &payload, Some(&app)).await;
+    }
+    if namespace == "session" && method == "prompt" {
+        return handle_native_rpc(&namespace, &method, &payload, Some(&app)).await;
+    }
+
     let (port, cookie) = sidecar.get_auth_context().await;
     let port = match port {
         Some(p) => p,
-        None => return handle_native_rpc(&namespace, &method, &payload),
+        None => return handle_native_rpc(&namespace, &method, &payload, Some(&app)).await,
     };
 
     let full_method = format!("{namespace}/{method}");
@@ -661,7 +767,7 @@ async fn cmd_call_rpc(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("RPC HTTP transport to {url} failed ({e}); falling back to native handler");
-            return handle_native_rpc(&namespace, &method, &payload);
+            return handle_native_rpc(&namespace, &method, &payload, Some(&app)).await;
         }
     };
 
@@ -669,14 +775,14 @@ async fn cmd_call_rpc(
     tracing::debug!(">>> [RPC:RES] {namespace}/{method} -> status={status}");
     if !status.is_success() {
         tracing::warn!("RPC HTTP error {status} from daemon; falling back to native handler");
-        return handle_native_rpc(&namespace, &method, &payload);
+        return handle_native_rpc(&namespace, &method, &payload, Some(&app)).await;
     }
 
     let json: serde_json::Value = match resp.json().await {
         Ok(j) => j,
         Err(e) => {
             tracing::warn!("RPC JSON parse error ({e}); falling back to native handler");
-            return handle_native_rpc(&namespace, &method, &payload);
+            return handle_native_rpc(&namespace, &method, &payload, Some(&app)).await;
         }
     };
 
@@ -685,7 +791,7 @@ async fn cmd_call_rpc(
             return Ok(result.get("value").cloned().unwrap_or(serde_json::Value::Null));
         } else {
             tracing::warn!("Daemon RPC result not ok ({result:?}); falling back to native handler");
-            return handle_native_rpc(&namespace, &method, &payload);
+            return handle_native_rpc(&namespace, &method, &payload, Some(&app)).await;
         }
     }
 
@@ -694,9 +800,30 @@ async fn cmd_call_rpc(
 
 /// Send a frame into the WebSocket multiplexer on /api/remote.mux.
 #[tauri::command]
-async fn cmd_ws_send(sidecar: State<'_, DshSidecar>, message: String) -> Result<(), String> {
+async fn cmd_ws_send(
+    app: AppHandle,
+    sidecar: State<'_, DshSidecar>,
+    message: String,
+) -> Result<(), String> {
     tracing::debug!(">>> [WS:SEND] {message}");
-    sidecar.ws_send(message).await
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&message) {
+        if parsed.get("type").and_then(|t| t.as_str()) == Some("open") {
+            if let Some(stream_id) = parsed.get("streamId").and_then(|s| s.as_str()) {
+                crate::chat::set_active_stream_id(stream_id.to_string()).await;
+                crate::chat::emit_ws_message(&app, serde_json::json!({
+                    "type": "item",
+                    "streamId": stream_id,
+                    "value": {
+                        "type": "snapshot",
+                        "permissionPreset": "standard",
+                        "sandboxMode": "auto"
+                    }
+                }));
+            }
+        }
+    }
+    let _ = sidecar.ws_send(message).await;
+    Ok(())
 }
 
 /// Ensure the WebSocket connection to /api/remote.mux is established.

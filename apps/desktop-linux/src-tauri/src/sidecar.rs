@@ -459,6 +459,7 @@ async fn spawn_daemon_child(probed_env: &HashMap<String, String>) -> std::io::Re
 async fn run_embedded_http_server(
     listener: tokio::net::TcpListener,
     inner: Arc<Mutex<SupervisorState>>,
+    app: AppHandle,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -476,6 +477,7 @@ async fn run_embedded_http_server(
             Err(_) => break,
         };
 
+        let app_clone = app.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 8192];
             let n = match stream.read(&mut buf).await {
@@ -510,6 +512,46 @@ async fn run_embedded_http_server(
                 return;
             }
 
+            if path.starts_with("/oauth/callback") {
+                let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                let mut code = String::new();
+                let mut state = String::new();
+                for pair in query.split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        if k == "code" { code = v.to_string(); }
+                        else if k == "state" { state = v.to_string(); }
+                    }
+                }
+                info!("Handling OAuth callback: code={code}, state={state}");
+                match crate::oauth::exchange_official_code(&code, &state, &app_clone).await {
+                    Ok(authorized_url) => {
+                        let html = format!(
+                            "<!DOCTYPE html><html><head><meta charset='utf-8'><title>DeepSeek Harness Authorization</title></head><body style='font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif;background:#f8f9fa;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;'><div style='background:#fff;border-radius:16px;padding:36px;box-shadow:0 8px 30px rgba(0,0,0,0.08);text-align:center;max-width:420px;'><h2 style='color:#111;margin-bottom:12px;'>Authorization Successful!</h2><p style='color:#666;font-size:15px;line-height:1.5;'>Returning to DeepSeek Harness desktop application...</p><script>setTimeout(function(){{ window.location.href='{}'; }}, 300);</script></div></body></html>",
+                            authorized_url
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            html.len(),
+                            html
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                    Err(err) => {
+                        let html = format!(
+                            "<!DOCTYPE html><html><body><h2>Authentication Error</h2><p>{}</p></body></html>",
+                            err
+                        );
+                        let response = format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            html.len(),
+                            html
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                }
+                return;
+            }
+
             if path.starts_with("/api/") {
                 let api_parts: Vec<&str> = path.trim_start_matches("/api/").split('/').collect();
                 let ns = api_parts.first().copied().unwrap_or("");
@@ -522,7 +564,7 @@ async fn run_embedded_http_server(
                 };
 
                 let payload_json: serde_json::Value = serde_json::from_str(body_str).unwrap_or_default();
-                let res_json = crate::handle_native_rpc(ns, meth, &payload_json).unwrap_or_else(|e| {
+                let res_json = crate::handle_native_rpc(ns, meth, &payload_json, Some(&app_clone)).await.unwrap_or_else(|e| {
                     serde_json::json!({ "error": e })
                 });
 
@@ -558,8 +600,9 @@ async fn run_supervisor_loop(app: AppHandle, inner: Arc<Mutex<SupervisorState>>)
 
     if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", fallback_port)).await {
         let inner_http = Arc::clone(&inner);
+        let app_handle_http = app.clone();
         tokio::spawn(async move {
-            run_embedded_http_server(listener, inner_http).await;
+            run_embedded_http_server(listener, inner_http, app_handle_http).await;
         });
     }
 

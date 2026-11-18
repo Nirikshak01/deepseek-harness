@@ -72,8 +72,8 @@ export async function checkStoredAuth() {
 export async function startOAuthSignIn(onWaitingBrowser) {
   const client = getClientMetadata();
   const callbackOrigin = apiClient.getBaseUrl();
-  let authUrl = 'https://platform.deepseek.com/sign_in';
   let attemptId = 'auth-' + Date.now();
+  let authorizeUrl = null;
 
   try {
     let state = await callRpc('account', 'startSignIn', {
@@ -95,29 +95,34 @@ export async function startOAuthSignIn(onWaitingBrowser) {
     }
 
     if (attempt?.authorizeUrl) {
-      authUrl = attempt.authorizeUrl;
+      authorizeUrl = attempt.authorizeUrl;
     }
     if (attempt?.id) {
       attemptId = attempt.id;
     }
   } catch (rpcErr) {
-    console.warn('Daemon RPC startSignIn notice (opening platform sign-in directly):', rpcErr);
+    console.warn('Daemon RPC startSignIn notice:', rpcErr);
   }
 
-  // Open the platform OAuth URL in system default browser immediately
-  try {
-    if (window.__TAURI__ && window.__TAURI__.core) {
-      await window.__TAURI__.core.invoke('cmd_open_browser', { url: authUrl });
-    } else {
-      window.open(authUrl, '_blank');
+  if (authorizeUrl) {
+    if (onWaitingBrowser) {
+      onWaitingBrowser({ id: attemptId, authorizeUrl });
     }
-  } catch (browserErr) {
-    console.warn('cmd_open_browser notice; trying window.open fallback:', browserErr);
-    window.open(authUrl, '_blank');
-  }
-
-  if (onWaitingBrowser) {
-    onWaitingBrowser({ id: attemptId, authorizeUrl: authUrl });
+  } else {
+    // If authorizeUrl could not be retrieved from auth_init, notify waiting browser
+    const fallbackUrl = 'https://platform.deepseek.com/dsh/authorize';
+    if (onWaitingBrowser) {
+      onWaitingBrowser({ id: attemptId, authorizeUrl: fallbackUrl });
+    }
+    try {
+      if (window.__TAURI__?.core) {
+        await window.__TAURI__.core.invoke('cmd_open_browser', { url: fallbackUrl });
+      } else {
+        window.open(fallbackUrl, '_blank');
+      }
+    } catch (e) {
+      console.warn('Open browser fallback warning:', e);
+    }
   }
 
   // Poll until browser exchange completes or attempt terminates
